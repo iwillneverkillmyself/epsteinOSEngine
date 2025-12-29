@@ -1,0 +1,63 @@
+# Core dependencies
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+python-multipart==0.0.6
+
+# OCR and image processing
+# PaddleOCR - state-of-the-art OCR with PP-OCRv4/v5 models
+paddlepaddle>=2.6.2  # PaddlePaddle framework (CPU version; use paddlepaddle-gpu for GPU)
+paddleocr==2.8.1     # PaddleOCR toolkit - pinned to avoid paddlex dependency hell
+
+# Legacy OCR engines (still available as fallback)
+easyocr==1.7.0
+pytesseract==0.3.10
+
+# Pillow>=10 removed Image.ANTIALIAS; EasyOCR 1.7.0 still references it.
+# We also apply a runtime shim in code, but pinning avoids surprises on fresh builds.
+Pillow==9.5.0
+pdf2image==1.16.3
+# Fast, poppler-free PDF rendering (used for page-at-a-time processing scripts)
+PyMuPDF==1.24.14
+opencv-python==4.8.1.78
+numpy>=1.24.3,<2.0
+
+# Image preprocessing for OCR accuracy
+scikit-image==0.22.0  # For deskewing and advanced preprocessing
+
+# Text processing and NLP
+spacy==3.7.2
+regex==2023.10.3
+python-dateutil==2.8.2
+
+# Database and storage
+sqlalchemy==2.0.23
+alembic==1.12.1
+psycopg2-binary==2.9.9  # PostgreSQL adapter
+# sqlite3 is built-in
+
+# Vector search (optional semantic search)
+# Pin exact versions to avoid slow dependency resolution
+chromadb==0.4.18
+sentence-transformers==2.7.0
+huggingface_hub==0.21.4
+
+# HTTP and crawling
+httpx==0.25.2
+aiohttp==3.9.1
+beautifulsoup4==4.12.2
+
+# AWS Rekognition (for image label detection)
+boto3>=1.34.0
+
+# Utilities
+python-dotenv==1.0.0
+pyyaml==6.0.1
+tqdm==4.66.1
+
+# Development
+pytest==7.4.3
+pytest-asyncio==0.21.1
+black==23.11.0
+flake8==6.1.0
+

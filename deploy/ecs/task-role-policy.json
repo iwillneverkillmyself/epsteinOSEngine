@@ -1,0 +1,33 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "S3AssetsRead",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": ["arn:aws:s3:::<YOUR_BUCKET>/*"]
+    },
+    {
+      "Sid": "TextractReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "textract:AnalyzeDocument",
+        "textract:DetectDocumentText"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "RekognitionReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "rekognition:DetectLabels",
+        "rekognition:RecognizeCelebrities"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+
+
+
+

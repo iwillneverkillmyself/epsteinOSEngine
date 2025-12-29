@@ -1,0 +1,54 @@
+# Alternative Dockerfile using debian:bullseye-slim base
+# Use this if the python:3.11-slim base has issues
+
+FROM debian:bullseye-slim
+
+# Install Python and system dependencies
+RUN apt-get update --fix-missing && \
+    apt-get install -y --no-install-recommends \
+    python3.11 \
+    python3.11-dev \
+    python3-pip \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    poppler-utils \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libgomp1 \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create symlink for python
+RUN ln -s /usr/bin/python3.11 /usr/bin/python && \
+    ln -s /usr/bin/python3.11 /usr/bin/python3
+
+# Set working directory
+WORKDIR /app
+
+# Copy requirements
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip3 install --no-cache-dir --upgrade pip && \
+    pip3 install --no-cache-dir -r requirements.txt
+
+# Download spacy model
+RUN python3 -m spacy download en_core_web_sm || true
+
+# Copy application code
+COPY . .
+
+# Create data directories
+RUN mkdir -p /app/data/storage /app/data/images /app/data/indexes
+
+# Expose API port
+EXPOSE 8000
+
+# Default command (can be overridden)
+CMD ["python3", "-m", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+
+

@@ -1,0 +1,49 @@
+{
+  "family": "epsteingptengine-api",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/epsteingptengineTaskRole",
+  "containerDefinitions": [
+    {
+      "name": "api",
+      "image": "<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/epsteingptengine:<TAG>",
+      "essential": true,
+      "portMappings": [{ "containerPort": 8000, "protocol": "tcp" }],
+      "environment": [
+        { "name": "PORT", "value": "8000" },
+        { "name": "LOG_LEVEL", "value": "INFO" },
+        { "name": "DATABASE_URL", "value": "postgresql+psycopg2://postgres:<PASSWORD>@<RDS_ENDPOINT>:5432/epsteingptengine?sslmode=require" },
+
+        { "name": "S3_BUCKET", "value": "<YOUR_BUCKET>" },
+        { "name": "S3_REGION", "value": "<REGION>" },
+        { "name": "S3_FILES_PREFIX", "value": "files" },
+        { "name": "S3_IMAGES_PREFIX", "value": "images" },
+        { "name": "S3_PRESIGN_EXPIRES_SECONDS", "value": "3600" },
+
+        { "name": "OCR_ENGINE", "value": "textract" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/epsteingptengine-api",
+          "awslogs-region": "<REGION>",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()\" || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 30
+      }
+    }
+  ]
+}
+
+
+
+
