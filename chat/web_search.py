@@ -27,16 +27,21 @@ def search_web_news(query: str, max_results: int = 5) -> List[Dict]:
     """
     try:
         # Enhance query with Jeffrey Epstein context
-        enhanced_query = f"Jeffrey Epstein {query}"
+        enhanced_query = f"Jeffrey Epstein {query} news"
         
         # Use DuckDuckGo HTML search (no API key needed)
         search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(enhanced_query)}"
         
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
         }
         
-        with httpx.Client(timeout=10.0, follow_redirects=True) as client:
+        with httpx.Client(timeout=15.0, follow_redirects=True) as client:
             response = client.get(search_url, headers=headers)
             response.raise_for_status()
             
@@ -44,22 +49,99 @@ def search_web_news(query: str, max_results: int = 5) -> List[Dict]:
             soup = BeautifulSoup(response.text, "html.parser")
             results = []
             
-            # DuckDuckGo HTML structure
+            # Try multiple DuckDuckGo HTML structures (they change frequently)
+            # Method 1: Try class="result"
             result_divs = soup.find_all("div", class_="result")
             
+            # Method 2: If no results, try alternative structure
+            if not result_divs:
+                result_divs = soup.find_all("div", class_="web-result")
+            
+            # Method 3: Try finding result links directly
+            if not result_divs:
+                result_links = soup.find_all("a", class_="result__a")
+                for link in result_links[:max_results]:
+                    try:
+                        title = link.get_text(strip=True)
+                        url = link.get("href", "")
+                        if not url or not title:
+                            continue
+                        
+                        # Try to find snippet nearby
+                        parent = link.find_parent()
+                        snippet = ""
+                        if parent:
+                            snippet_elem = parent.find("a", class_="result__snippet")
+                            if snippet_elem:
+                                snippet = snippet_elem.get_text(strip=True)
+                            else:
+                                # Try to find any text after the link
+                                for sibling in parent.next_siblings:
+                                    if hasattr(sibling, 'get_text'):
+                                        snippet = sibling.get_text(strip=True)[:300]
+                                        break
+                        
+                        source = ""
+                        try:
+                            from urllib.parse import urlparse
+                            parsed = urlparse(url)
+                            source = parsed.netloc.replace("www.", "")
+                        except:
+                            pass
+                        
+                        if url and title:
+                            results.append({
+                                "title": title,
+                                "url": url,
+                                "snippet": snippet[:300],
+                                "source": source,
+                            })
+                    except Exception as e:
+                        logger.debug(f"Error parsing result link: {e}")
+                        continue
+            
+            # Parse results from divs
             for div in result_divs[:max_results]:
                 try:
                     # Extract title and URL
                     title_elem = div.find("a", class_="result__a")
                     if not title_elem:
-                        continue
+                        # Try alternative selectors
+                        title_elem = div.find("a", href=True)
+                        if not title_elem:
+                            continue
                     
                     title = title_elem.get_text(strip=True)
                     url = title_elem.get("href", "")
                     
+                    # Clean up URL (DuckDuckGo sometimes wraps URLs)
+                    if url.startswith("/l/?kh="):
+                        # Extract actual URL from DuckDuckGo redirect
+                        try:
+                            from urllib.parse import parse_qs, urlparse
+                            parsed = urlparse(url)
+                            params = parse_qs(parsed.query)
+                            if "uddg" in params:
+                                url = params["uddg"][0]
+                        except:
+                            pass
+                    
                     # Extract snippet
+                    snippet = ""
                     snippet_elem = div.find("a", class_="result__snippet")
-                    snippet = snippet_elem.get_text(strip=True) if snippet_elem else ""
+                    if snippet_elem:
+                        snippet = snippet_elem.get_text(strip=True)
+                    else:
+                        # Try alternative snippet selectors
+                        snippet_elem = div.find("div", class_="result__snippet")
+                        if snippet_elem:
+                            snippet = snippet_elem.get_text(strip=True)
+                        else:
+                            # Get any text content from the div
+                            snippet = div.get_text(strip=True)
+                            # Remove title from snippet if present
+                            if title in snippet:
+                                snippet = snippet.replace(title, "", 1).strip()
                     
                     # Extract source domain
                     source = ""
@@ -82,7 +164,16 @@ def search_web_news(query: str, max_results: int = 5) -> List[Dict]:
                     logger.debug(f"Error parsing search result: {e}")
                     continue
             
-            return results
+            # Remove duplicates based on URL
+            seen_urls = set()
+            unique_results = []
+            for result in results:
+                if result["url"] not in seen_urls:
+                    seen_urls.add(result["url"])
+                    unique_results.append(result)
+            
+            logger.info(f"Web search found {len(unique_results)} results for query: {query}")
+            return unique_results[:max_results]
             
     except Exception as e:
         logger.error(f"Web search error: {e}", exc_info=True)

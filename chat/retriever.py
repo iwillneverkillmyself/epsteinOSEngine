@@ -93,9 +93,13 @@ def retrieve_passages(query: str, top_k: int = 8, search_type: str = "keyword", 
         try:
             from chat.web_search import retrieve_web_news_passages
             web_passages = retrieve_web_news_passages(query, top_k=min(5, top_k // 2))
-            all_passages.extend(web_passages)
+            if web_passages:
+                logger.info(f"Web search found {len(web_passages)} articles for query: {query}")
+                all_passages.extend(web_passages)
+            else:
+                logger.warning(f"Web search returned no results for query: {query}")
         except Exception as e:
-            logger.warning(f"Web search failed: {e}", exc_info=True)
+            logger.error(f"Web search failed: {e}", exc_info=True)
             # Continue without web results if search fails
     
     # Sort by score descending
