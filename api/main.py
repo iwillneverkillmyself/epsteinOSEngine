@@ -270,7 +270,7 @@ async def search(request: SearchRequest):
 
 
 # ============================================
-# Comments (anonymous username via signed header)
+# Comments (random Kahoot-style usernames)
 # ============================================
 
 class CommentCreateRequest(BaseModel):
@@ -573,8 +573,26 @@ async def post_document_comment(document_id: str, req: CommentCreateRequest, req
             ip_hash=_ip_hash(request),
         )
         db.add(c)
-        db.flush()
-        return {"comment": {"id": c.id, "username": username, "avatar_url": avatar_url}}
+        db.flush()  # Flush to get the ID and created_at
+        db.refresh(c)  # Refresh to ensure we have all fields
+        
+        return {
+            "comment": {
+                "id": c.id,
+                "target_type": c.target_type,
+                "document_id": c.document_id,
+                "page_number": c.page_number,
+                "image_page_id": c.image_page_id,
+                "parent_id": c.parent_id,
+                "username": username,
+                "avatar_url": avatar_url,
+                "body": body,
+                "created_at": c.created_at.isoformat() if c.created_at else None,
+                "likes_count": c.likes_count or 0,
+                "dislikes_count": c.dislikes_count or 0,
+                "replies": [],
+            }
+        }
 
 
 @app.post("/images/{image_page_id}/comments")
@@ -610,8 +628,26 @@ async def post_image_comment(image_page_id: str, req: CommentCreateRequest, requ
             ip_hash=_ip_hash(request),
         )
         db.add(c)
-        db.flush()
-        return {"comment": {"id": c.id, "username": username, "avatar_url": avatar_url}}
+        db.flush()  # Flush to get the ID and created_at
+        db.refresh(c)  # Refresh to ensure we have all fields
+        
+        return {
+            "comment": {
+                "id": c.id,
+                "target_type": c.target_type,
+                "document_id": c.document_id,
+                "page_number": c.page_number,
+                "image_page_id": c.image_page_id,
+                "parent_id": c.parent_id,
+                "username": username,
+                "avatar_url": avatar_url,
+                "body": body,
+                "created_at": c.created_at.isoformat() if c.created_at else None,
+                "likes_count": c.likes_count or 0,
+                "dislikes_count": c.dislikes_count or 0,
+                "replies": [],
+            }
+        }
 
 
 @app.post("/comments/{comment_id}/replies")
@@ -649,8 +685,25 @@ async def post_reply(comment_id: str, req: ReplyCreateRequest, request: Request)
             ip_hash=_ip_hash(request),
         )
         db.add(r)
-        db.flush()
-        return {"reply": {"id": r.id, "username": username, "avatar_url": avatar_url}}
+        db.flush()  # Flush to get the ID and created_at
+        db.refresh(r)  # Refresh to ensure we have all fields
+        
+        return {
+            "reply": {
+                "id": r.id,
+                "target_type": r.target_type,
+                "document_id": r.document_id,
+                "page_number": r.page_number,
+                "image_page_id": r.image_page_id,
+                "parent_id": r.parent_id,
+                "username": username,
+                "avatar_url": avatar_url,
+                "body": body,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "likes_count": r.likes_count or 0,
+                "dislikes_count": r.dislikes_count or 0,
+            }
+        }
 
 
 @app.post("/comments/{comment_id}/like")
@@ -837,14 +890,17 @@ class ChatRequest(BaseModel):
 
 
 class Citation(BaseModel):
-    """A citation to a document passage."""
+    """A citation to a document passage or web article."""
     document_id: str
     page_id: Optional[str] = None
     page_number: int
     snippet: str
-    score: float
-    file_url: str
-    thumbnail_url: str
+    score: Optional[float] = None
+    file_url: str  # Can be document URL or news article URL
+    thumbnail_url: Optional[str] = None
+    title: Optional[str] = None  # For web articles
+    source: Optional[str] = None  # For web articles (domain name)
+    url: Optional[str] = None  # Original URL for web articles
 
 
 class ChatResponse(BaseModel):
@@ -854,35 +910,20 @@ class ChatResponse(BaseModel):
     debug: Optional[Dict[str, Any]] = None
 
 
-def _verify_api_key(request: Request) -> None:
-    """Verify X-API-Key header matches CHAT_API_KEY."""
-    api_key = request.headers.get("LAf4zsG1Zg3ePbFqkWQvNemTRy5S0c2d")
-    expected_key = os.getenv("CHAT_API_KEY")
-    
-    if not expected_key:
-        logger.warning("CHAT_API_KEY not configured, chat API is disabled")
-        raise HTTPException(status_code=503, detail="Chat API is not configured")
-    
-    if not api_key or api_key != expected_key:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
-
-
-
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request_body: ChatRequest, http_request: Request):
     """
     Stateless chat API for EpsteinGPT.
     
-    Requires X-API-Key header with valid API key.
+    Requires X-API-Key header with valid API key (checked by middleware).
     
     Returns:
     - answer: The model's answer in plain text
     - citations: List of document citations used in the answer
     - debug: Optional debug information (if debug=true in request)
     """
-    # Verify API key
-    _verify_api_key(http_request)
+    # Note: API key is already verified by APIKeyMiddleware, no need to check again
     
     # Extract latest user question
     user_messages = [msg for msg in request_body.messages if msg.role == "user"]
@@ -914,14 +955,14 @@ async def chat(request_body: ChatRequest, http_request: Request):
     top_k = min(request_body.top_k or 8, 20)  # Max 20 passages
     
     try:
-        # Retrieve passages
+        # Retrieve passages (from both local documents and web news)
         from chat.retriever import retrieve_passages
         
         search_type = request_body.search_type or "keyword"
         if search_type not in ["keyword", "phrase", "fuzzy", "semantic"]:
             search_type = "keyword"
         
-        citations = retrieve_passages(user_question, top_k=top_k, search_type=search_type)
+        citations = retrieve_passages(user_question, top_k=top_k, search_type=search_type, include_web=True)
         
         # Build conversation history (last N messages, excluding current question)
         conversation_history = []
@@ -949,9 +990,12 @@ async def chat(request_body: ChatRequest, http_request: Request):
                 page_id=cit.get("page_id"),
                 page_number=cit["page_number"],
                 snippet=cit["snippet"],
-                score=cit["score"],
+                score=cit.get("score"),
                 file_url=cit["file_url"],
-                thumbnail_url=cit["thumbnail_url"],
+                thumbnail_url=cit.get("thumbnail_url"),
+                title=cit.get("title"),  # Web article title
+                source=cit.get("source"),  # Web article source
+                url=cit.get("url"),  # Web article URL
             ))
         
         # Build response - convert markdown to plain text if needed
@@ -1903,6 +1947,26 @@ async def list_files(
     Example: GET /files?limit=20&offset=0
     """
     return await search_files(q=None, has_text=None, limit=limit, offset=offset)
+
+
+@app.get("/username/random")
+async def get_random_username():
+    """
+    Generate a random Kahoot-style username for preview.
+    
+    Returns:
+    - username: Random username (e.g., "RetiredMonkey")
+    - avatar_url: URL to the avatar image for this username
+    """
+    from comments.avatars import get_avatar_url
+    
+    username = _generate_random_username()
+    avatar_url = get_avatar_url(username)
+    
+    return {
+        "username": username,
+        "avatar_url": avatar_url
+    }
 
 
 @app.get("/avatars/{username}")
