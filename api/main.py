@@ -2608,6 +2608,26 @@ async def process_celebrities(
 _doj_ingestion_task = None
 _doj_pause_event = None
 
+
+def _ensure_ingestion_state_row(name: str = "doj"):
+    """
+    Ensure the durable ingestion_state row exists.
+    This allows status/control to survive API restarts.
+    """
+    try:
+        from database import get_db
+        from models import IngestionState
+
+        with get_db() as db:
+            st = db.query(IngestionState).filter(IngestionState.name == name).first()
+            if st is None:
+                st = IngestionState(name=name, enabled=True, paused=False)
+                db.add(st)
+                db.flush()
+    except Exception as e:
+        # Don't block API startup or ingestion due to best-effort state init.
+        logger.warning(f"Failed to ensure ingestion_state row for {name}: {e}")
+
 class DOJIngestionResponse(BaseModel):
     """Response for DOJ file ingestion."""
     status: str
@@ -2860,6 +2880,16 @@ async def pause_doj_ingestion():
         _doj_pause_event = _asyncio.Event()
         _doj_pause_event.set()
     _doj_pause_event.clear()
+    _ensure_ingestion_state_row("doj")
+    try:
+        from database import get_db
+        from models import IngestionState
+        with get_db() as db:
+            st = db.query(IngestionState).filter(IngestionState.name == "doj").first()
+            if st:
+                st.paused = True
+    except Exception as e:
+        logger.warning(f"Failed to persist DOJ paused state: {e}")
     return {"status": "paused", "message": "DOJ ingestion paused (will pause between files)."}
 
 
@@ -2871,6 +2901,17 @@ async def resume_doj_ingestion():
     if _doj_pause_event is None:
         _doj_pause_event = _asyncio.Event()
     _doj_pause_event.set()
+    _ensure_ingestion_state_row("doj")
+    try:
+        from database import get_db
+        from models import IngestionState
+        with get_db() as db:
+            st = db.query(IngestionState).filter(IngestionState.name == "doj").first()
+            if st:
+                st.paused = False
+                st.enabled = True
+    except Exception as e:
+        logger.warning(f"Failed to persist DOJ resumed state: {e}")
     return {"status": "running", "message": "DOJ ingestion resumed."}
 
 
@@ -2880,7 +2921,30 @@ async def status_doj_ingestion():
     global _doj_ingestion_task, _doj_pause_event
     running = _doj_ingestion_task is not None and not _doj_ingestion_task.done()
     paused = (_doj_pause_event is not None) and (not _doj_pause_event.is_set())
-    return {"running": bool(running), "paused": bool(paused)}
+    # Durable state (if DOJ service is running, this is the source of truth)
+    durable = {}
+    try:
+        from database import get_db
+        from models import IngestionState
+        with get_db() as db:
+            st = db.query(IngestionState).filter(IngestionState.name == "doj").first()
+            if st:
+                durable = {
+                    "enabled": bool(st.enabled),
+                    "paused": bool(st.paused),
+                    "last_heartbeat_at": st.last_heartbeat_at.isoformat() if st.last_heartbeat_at else None,
+                    "last_run_started_at": st.last_run_started_at.isoformat() if st.last_run_started_at else None,
+                    "last_run_completed_at": st.last_run_completed_at.isoformat() if st.last_run_completed_at else None,
+                    "last_error": st.last_error,
+                }
+    except Exception as e:
+        logger.warning(f"Failed to read durable DOJ status: {e}")
+
+    return {
+        "running": bool(running),
+        "paused": bool(paused),
+        "durable": durable or None,
+    }
 
 
 @app.get("/ingest/doj/preview")

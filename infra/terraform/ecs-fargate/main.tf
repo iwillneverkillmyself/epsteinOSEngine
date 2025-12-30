@@ -375,6 +375,47 @@ resource "aws_ecs_task_definition" "worker" {
   ])
 }
 
+resource "aws_ecs_task_definition" "doj_ingester" {
+  family                   = "${local.name_prefix}-doj-ingester"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = tostring(var.cpu)
+  memory                   = tostring(var.memory)
+  execution_role_arn       = aws_iam_role.task_execution.arn
+  task_role_arn            = aws_iam_role.task.arn
+
+  container_definitions = jsonencode([
+    {
+      name      = "doj_ingester"
+      image     = local.image_uri
+      essential = true
+      command   = ["python", "-m", "ingestion.doj_service"]
+      environment = [
+        { name = "LOG_LEVEL", value = var.log_level },
+        { name = "S3_BUCKET", value = aws_s3_bucket.assets.bucket },
+        { name = "S3_REGION", value = var.aws_region },
+        { name = "S3_FILES_PREFIX", value = var.s3_files_prefix },
+        { name = "S3_IMAGES_PREFIX", value = var.s3_images_prefix },
+        { name = "DOJ_SKIP_EXISTING", value = "true" },
+        { name = "DOJ_INGEST_POLL_SECONDS", value = "60" },
+        { name = "DOJ_INGEST_RUN_INTERVAL_SECONDS", value = "600" }
+      ]
+      secrets = [
+        { name = "DATABASE_URL", valueFrom = aws_ssm_parameter.database_url.arn },
+        { name = "COMMENTS_HMAC_SECRET", valueFrom = aws_ssm_parameter.comments_hmac_secret.arn }
+      ]
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          awslogs-group         = aws_cloudwatch_log_group.api.name
+          awslogs-region        = var.aws_region
+          awslogs-stream-prefix = "doj"
+        }
+      }
+    }
+  ])
+}
+
 resource "aws_ecs_service" "api" {
   name            = "${local.name_prefix}-service"
   cluster         = aws_ecs_cluster.api.id
@@ -402,6 +443,20 @@ resource "aws_ecs_service" "worker" {
   cluster         = aws_ecs_cluster.api.id
   task_definition = aws_ecs_task_definition.worker.arn
   desired_count   = var.worker_desired_count
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = data.aws_subnets.default.ids
+    security_groups  = [aws_security_group.ecs_tasks.id]
+    assign_public_ip = true
+  }
+}
+
+resource "aws_ecs_service" "doj_ingester" {
+  name            = "${local.name_prefix}-doj-ingester-service"
+  cluster         = aws_ecs_cluster.api.id
+  task_definition = aws_ecs_task_definition.doj_ingester.arn
+  desired_count   = 1
   launch_type     = "FARGATE"
 
   network_configuration {
