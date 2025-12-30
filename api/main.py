@@ -984,7 +984,19 @@ async def chat(request_body: ChatRequest, http_request: Request):
         if search_type not in ["keyword", "phrase", "fuzzy", "semantic"]:
             search_type = "keyword"
         
-        citations = retrieve_passages(user_question, top_k=top_k, search_type=search_type, include_web=True)
+        all_citations = retrieve_passages(user_question, top_k=top_k, search_type=search_type, include_web=True)
+
+        def _is_news_intent(q: str) -> bool:
+            ql = (q or "").lower()
+            news_keywords = [
+                "latest", "recent", "today", "this week", "new", "developments", "updates",
+                "breaking", "news", "headlines", "current", "right now",
+            ]
+            return any(k in ql for k in news_keywords)
+
+        # If the user is asking for "latest/news" and we have web sources, prioritize web-only.
+        web_citations = [c for c in all_citations if c.get("url") or (isinstance(c.get("file_url"), str) and str(c.get("file_url")).startswith("http"))]
+        citations = web_citations if (_is_news_intent(user_question) and web_citations) else all_citations
         
         # Build conversation history (last N messages, excluding current question)
         conversation_history = []
@@ -1069,6 +1081,31 @@ async def chat(request_body: ChatRequest, http_request: Request):
                 answer_text = f"I found 1 document that mentions \"{user_question}\". See the citations below for details."
             else:
                 answer_text = f"I found {len(citation_models)} relevant passages across {len(doc_ids)} documents related to \"{user_question}\". See the citations below for details."
+
+        # If we used web citations, append explicit source URLs so the user can open them in a new tab
+        # even if the client UI doesn't render citation cards as links.
+        if citations:
+            web_sources = []
+            for c in citations:
+                u = c.get("url") or c.get("file_url")
+                if isinstance(u, str) and (u.startswith("http://") or u.startswith("https://")):
+                    title = c.get("title") or "Source"
+                    source = c.get("source")
+                    label = f"{title} ({source})" if source else str(title)
+                    web_sources.append((label, u))
+            if web_sources:
+                # De-dupe while preserving order
+                seen = set()
+                deduped = []
+                for label, u in web_sources:
+                    if u in seen:
+                        continue
+                    seen.add(u)
+                    deduped.append((label, u))
+                lines = ["", "Sources:"]
+                for (label, u) in deduped[:5]:
+                    lines.append(f"- {label}: {u}")
+                answer_text = (answer_text + "\n" + "\n".join(lines)).strip()
         
         # Provide preview/full fields for "read more" UX.
         # We keep `answer` as the full answer for backward compatibility, and also return preview fields.
