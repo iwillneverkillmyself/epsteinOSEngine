@@ -1167,7 +1167,7 @@ async def chat(request_body: ChatRequest, http_request: Request):
 async def get_stats():
     """Get system statistics."""
     from database import get_db
-    from models import Document, ImagePage, OCRText, Entity, SearchIndex, ImageLabel
+    from models import Document, ImagePage, OCRText, Entity, SearchIndex, ImageLabel, DocumentSummary
     
     try:
         with get_db() as db:
@@ -1185,6 +1185,24 @@ async def get_stats():
             
             processed_pages = db.query(ImagePage).filter(
                 ImagePage.ocr_processed == True
+            ).count()
+            
+            # Documents with OCR text (distinct document_ids)
+            docs_with_ocr = db.query(OCRText.document_id).distinct().count()
+            docs_without_ocr = doc_count - docs_with_ocr if doc_count > 0 else 0
+            
+            # Documents with successful summaries
+            docs_with_summaries = db.query(DocumentSummary).filter(
+                DocumentSummary.status == "succeeded"
+            ).count()
+            
+            # Documents with any summary row (including failed/pending)
+            docs_with_summary_row = db.query(DocumentSummary).count()
+            docs_without_summaries = doc_count - docs_with_summary_row if doc_count > 0 else 0
+            
+            # Documents with pending/failed summaries
+            docs_pending_summaries = db.query(DocumentSummary).filter(
+                DocumentSummary.status.in_(["pending", "failed"])
             ).count()
     except Exception as e:
         logger.exception(f"Stats query failed: {e}")
@@ -1213,7 +1231,18 @@ async def get_stats():
         "image_labels": label_count,
         "search_index_rows": search_index_count,
         "processed_pages": processed_pages,
-        "processing_rate": f"{processed_pages}/{page_count}" if page_count > 0 else "0/0"
+        "processing_rate": f"{processed_pages}/{page_count}" if page_count > 0 else "0/0",
+        "ocr_processing": {
+            "documents_with_ocr": docs_with_ocr,
+            "documents_without_ocr": docs_without_ocr,
+            "completion_percent": round(docs_with_ocr / doc_count * 100, 1) if doc_count > 0 else 0
+        },
+        "summary_processing": {
+            "documents_with_summaries": docs_with_summaries,
+            "documents_without_summaries": docs_without_summaries,
+            "documents_pending_summaries": docs_pending_summaries,
+            "completion_percent": round(docs_with_summaries / doc_count * 100, 1) if doc_count > 0 else 0
+        }
     }
 
 
