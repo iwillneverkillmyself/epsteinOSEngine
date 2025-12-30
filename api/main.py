@@ -628,7 +628,23 @@ async def post_image_comment(image_page_id: str, req: CommentCreateRequest, requ
     avatar_url = generate_and_upload_avatar(username)
 
     with get_db() as db:
+        # Try to find image page by ID
         img = db.query(ImagePage).filter(ImagePage.id == image_page_id).first()
+        
+        # If not found, try treating image_page_id as document_id and look for page 1
+        if not img:
+            # Check if it looks like a document_id (no _page_ suffix)
+            if "_page_" not in image_page_id:
+                # Try to find the first page for this document
+                img = db.query(ImagePage).filter(
+                    ImagePage.document_id == image_page_id,
+                    ImagePage.page_number == 1
+                ).first()
+                if img:
+                    # Use the actual image_page_id
+                    image_page_id = img.id
+                    logger.info(f"Resolved document_id {image_page_id} to image_page_id {img.id}")
+        
         if not img:
             raise HTTPException(status_code=404, detail=f"Image page {image_page_id} not found")
 
