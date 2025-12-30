@@ -916,12 +916,19 @@ class Citation(BaseModel):
     title: Optional[str] = None  # For web articles
     source: Optional[str] = None  # For web articles (domain name)
     url: Optional[str] = None  # Original URL for web articles
+    open_url: Optional[str] = None  # Absolute URL a client can open in a new tab
+    is_web: bool = False
 
 
 class ChatResponse(BaseModel):
     """Response from chat API."""
     answer: str
+    answer_preview: Optional[str] = None  # Short preview for UI (read-more)
+    answer_full: Optional[str] = None  # Full answer text for UI expansion
+    has_more: Optional[bool] = None  # True if preview is truncated
     citations: List[Citation]
+    suggest_open_documents: Optional[bool] = None  # UI hint: show "Open X documents" CTA
+    suggested_documents: Optional[List[Dict[str, Any]]] = None  # UI hint payload
     debug: Optional[Dict[str, Any]] = None
 
 
@@ -997,9 +1004,36 @@ async def chat(request_body: ChatRequest, http_request: Request):
             max_tokens=2000,
         )
         
+        def _wants_document_open_cta(q: str) -> bool:
+            ql = (q or "").lower()
+            keywords = [
+                "open", "find", "where", "show me", "which document", "which file",
+                "pdf", "document", "file", "download", "link", "source", "citation",
+                "ef ta", "efta", "exhibit", "page", "doc id", "document id",
+            ]
+            return any(k in ql for k in keywords)
+
+        def _absolutize(url_or_path: Optional[str]) -> Optional[str]:
+            if not url_or_path:
+                return None
+            s = str(url_or_path)
+            if s.startswith("http://") or s.startswith("https://"):
+                return s
+            # Convert relative path to absolute using incoming request base URL
+            try:
+                from urllib.parse import urljoin
+                base = str(http_request.base_url)
+                return urljoin(base, s.lstrip("/"))
+            except Exception:
+                return s
+
         # Map citations to response format
         citation_models = []
         for cit in citations:
+            is_web = bool(cit.get("url")) or (isinstance(cit.get("file_url"), str) and str(cit.get("file_url")).startswith("http"))
+            # Prefer explicit web URL; otherwise fall back to file_url (document endpoint path)
+            open_url = _absolutize(cit.get("url") or cit.get("file_url"))
+
             citation_models.append(Citation(
                 document_id=cit["document_id"],
                 page_id=cit.get("page_id"),
@@ -1011,6 +1045,8 @@ async def chat(request_body: ChatRequest, http_request: Request):
                 title=cit.get("title"),  # Web article title
                 source=cit.get("source"),  # Web article source
                 url=cit.get("url"),  # Web article URL
+                open_url=open_url,
+                is_web=bool(is_web),
             ))
         
         # Build response - convert markdown to plain text if needed
@@ -1034,9 +1070,42 @@ async def chat(request_body: ChatRequest, http_request: Request):
             else:
                 answer_text = f"I found {len(citation_models)} relevant passages across {len(doc_ids)} documents related to \"{user_question}\". See the citations below for details."
         
+        # Provide preview/full fields for "read more" UX.
+        # We keep `answer` as the full answer for backward compatibility, and also return preview fields.
+        preview_limit = 900
+        answer_full = answer_text or ""
+        answer_preview = answer_full
+        has_more = False
+        if len(answer_full) > preview_limit:
+            answer_preview = answer_full[:preview_limit].rstrip() + "…"
+            has_more = True
+
+        # UI hint: only suggest "Open X documents" CTA when user intent matches.
+        local_doc_ids = []
+        for cm in citation_models:
+            if not cm.is_web and cm.document_id:
+                local_doc_ids.append(cm.document_id)
+        unique_local_doc_ids = list(dict.fromkeys(local_doc_ids))  # stable unique
+
+        suggest_open = bool(unique_local_doc_ids) and _wants_document_open_cta(user_question)
+        suggested_docs_payload = None
+        if suggest_open:
+            suggested_docs_payload = [
+                {
+                    "document_id": did,
+                    "open_url": _absolutize(f"/files/{did}"),
+                }
+                for did in unique_local_doc_ids[:20]
+            ]
+
         response = ChatResponse(
-            answer=answer_text,
+            answer=answer_full,
+            answer_preview=answer_preview,
+            answer_full=answer_full,
+            has_more=has_more,
             citations=citation_models,
+            suggest_open_documents=suggest_open,
+            suggested_documents=suggested_docs_payload,
         )
         
         # Add debug info if requested
