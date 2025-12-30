@@ -91,12 +91,27 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
     """Middleware to require API key authentication on all endpoints except /health."""
     
     async def dispatch(self, request: StarletteRequest, call_next):
+        path = request.url.path
+
         # Allow health check and root endpoint without auth
-        if request.url.path in ["/health", "/"]:
+        if path in ["/health", "/"]:
             return await call_next(request)
         
         # Allow OPTIONS requests (CORS preflight) without auth
         if request.method == "OPTIONS":
+            return await call_next(request)
+
+        # IMPORTANT: Browser asset requests (img/iframe/object) cannot attach custom headers like X-API-Key.
+        # We allow read-only asset endpoints so PDFs/images/thumbnails/avatars can load in the UI.
+        # Listing/search endpoints remain protected by the API key.
+        public_asset_prefixes = (
+            "/images/",
+            "/thumbnails/",
+            "/file-thumbnails/",
+            "/avatars/",
+            "/files/",
+        )
+        if path.startswith(public_asset_prefixes) and path not in ("/images", "/thumbnails", "/avatars", "/files", "/file-thumbnails"):
             return await call_next(request)
         
         # Check for API key (try both X-API-Key and x-api-key for case-insensitivity)
