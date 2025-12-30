@@ -1246,6 +1246,46 @@ async def get_stats():
     }
 
 
+@app.get("/stats/processing")
+async def get_processing_stats():
+    """Get lightweight processing statistics (documents with/without summaries, OCR)."""
+    from database import get_db
+    from models import Document, DocumentSummary, OCRText
+    from sqlalchemy import func
+    
+    try:
+        with get_db() as db:
+            # Total documents
+            total_docs = db.query(func.count(Document.id)).scalar()
+            
+            # Documents with successful summaries
+            docs_with_summaries = db.query(func.count(DocumentSummary.document_id)).filter(
+                DocumentSummary.status == "succeeded"
+            ).scalar()
+            
+            # Documents with any summary row
+            docs_with_summary_row = db.query(func.count(DocumentSummary.document_id)).scalar()
+            docs_without_summaries = total_docs - docs_with_summary_row if total_docs else 0
+            
+            # Documents with OCR text (distinct)
+            docs_with_ocr = db.query(func.count(func.distinct(OCRText.document_id))).scalar()
+            docs_without_ocr = total_docs - docs_with_ocr if total_docs else 0
+            
+    except Exception as e:
+        logger.exception(f"Processing stats query failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Database query failed: {str(e)}")
+    
+    return {
+        "total_documents": total_docs,
+        "documents_with_summaries": docs_with_summaries,
+        "documents_without_summaries": docs_without_summaries,
+        "documents_with_ocr": docs_with_ocr,
+        "documents_without_ocr": docs_without_ocr,
+        "summary_completion_percent": round(docs_with_summaries / total_docs * 100, 1) if total_docs > 0 else 0,
+        "ocr_completion_percent": round(docs_with_ocr / total_docs * 100, 1) if total_docs > 0 else 0
+    }
+
+
 @app.get("/suggest/entities")
 async def suggest_entities(
     entity_type: str = Query("name", description="Entity type: name, email, phone, date"),
