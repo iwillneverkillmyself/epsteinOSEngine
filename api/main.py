@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse, RedirectResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
-from pydantic import BaseModel
+from pydantic import BaseModel, root_validator
 from typing import List, Optional, Dict, Any
 from pathlib import Path
 from io import BytesIO
@@ -91,27 +91,12 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
     """Middleware to require API key authentication on all endpoints except /health."""
     
     async def dispatch(self, request: StarletteRequest, call_next):
-        path = request.url.path
-
         # Allow health check and root endpoint without auth
-        if path in ["/health", "/"]:
+        if request.url.path in ["/health", "/"]:
             return await call_next(request)
         
         # Allow OPTIONS requests (CORS preflight) without auth
         if request.method == "OPTIONS":
-            return await call_next(request)
-
-        # IMPORTANT: Browser asset requests (img/iframe/object) cannot attach custom headers like X-API-Key.
-        # We allow read-only asset endpoints so PDFs/images/thumbnails/avatars can load in the UI.
-        # Listing/search endpoints remain protected by the API key.
-        public_asset_prefixes = (
-            "/images/",
-            "/thumbnails/",
-            "/file-thumbnails/",
-            "/avatars/",
-            "/files/",
-        )
-        if path.startswith(public_asset_prefixes) and path not in ("/images", "/thumbnails", "/avatars", "/files", "/file-thumbnails"):
             return await call_next(request)
         
         # Check for API key (try both X-API-Key and x-api-key for case-insensitivity)
@@ -285,16 +270,36 @@ async def search(request: SearchRequest):
 
 
 # ============================================
-# Comments (random Kahoot-style usernames)
+# Comments (anonymous username via signed header)
 # ============================================
 
 class CommentCreateRequest(BaseModel):
     body: str
     page_number: Optional[int] = None
 
+    @root_validator(pre=True)
+    def _normalize_body(cls, values):
+        # Be forgiving about frontend payload keys.
+        if isinstance(values, dict) and "body" not in values:
+            for k in ("text", "content", "comment", "message"):
+                if k in values and values.get(k) is not None:
+                    values["body"] = values.get(k)
+                    break
+        return values
+
 
 class ReplyCreateRequest(BaseModel):
     body: str
+
+    @root_validator(pre=True)
+    def _normalize_body(cls, values):
+        # Be forgiving about frontend payload keys.
+        if isinstance(values, dict) and "body" not in values:
+            for k in ("text", "content", "reply", "message"):
+                if k in values and values.get(k) is not None:
+                    values["body"] = values.get(k)
+                    break
+        return values
 
 
 def _comments_body_max_len() -> int:
@@ -302,6 +307,49 @@ def _comments_body_max_len() -> int:
         return int(os.getenv("COMMENTS_BODY_MAX_LEN", "4000"))
     except Exception:
         return 4000
+
+
+def _comment_to_dict(
+    *,
+    c,
+    avatar_url: Optional[str] = None,
+    replies: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """
+    Normalize a Comment (or a SQLAlchemy row with same attrs) to a stable JSON shape.
+    """
+    return {
+        "id": getattr(c, "id", None),
+        "target_type": getattr(c, "target_type", None),
+        "document_id": getattr(c, "document_id", None),
+        "page_number": getattr(c, "page_number", None),
+        "image_page_id": getattr(c, "image_page_id", None),
+        "parent_id": getattr(c, "parent_id", None),
+        "username": getattr(c, "username", None),
+        "avatar_url": avatar_url,
+        "body": getattr(c, "body", None),
+        "created_at": (getattr(c, "created_at", None).isoformat() if getattr(c, "created_at", None) else None),
+        "likes_count": getattr(c, "likes_count", 0) or 0,
+        "dislikes_count": getattr(c, "dislikes_count", 0) or 0,
+        "replies": replies or [],
+    }
+
+
+def _ensure_comment_matches_context(
+    *,
+    comment,
+    expected_target_type: str,
+    expected_document_id: Optional[str] = None,
+    expected_image_page_id: Optional[str] = None,
+):
+    if not comment:
+        raise HTTPException(status_code=404, detail="Comment not found")
+    if getattr(comment, "target_type", None) != expected_target_type:
+        raise HTTPException(status_code=404, detail="Comment not found")
+    if expected_document_id is not None and getattr(comment, "document_id", None) != expected_document_id:
+        raise HTTPException(status_code=404, detail="Comment not found")
+    if expected_image_page_id is not None and getattr(comment, "image_page_id", None) != expected_image_page_id:
+        raise HTTPException(status_code=404, detail="Comment not found")
 
 
 @app.get("/documents/{document_id}/comments")
@@ -588,26 +636,8 @@ async def post_document_comment(document_id: str, req: CommentCreateRequest, req
             ip_hash=_ip_hash(request),
         )
         db.add(c)
-        db.flush()  # Flush to get the ID and created_at
-        db.refresh(c)  # Refresh to ensure we have all fields
-        
-        return {
-            "comment": {
-                "id": c.id,
-                "target_type": c.target_type,
-                "document_id": c.document_id,
-                "page_number": c.page_number,
-                "image_page_id": c.image_page_id,
-                "parent_id": c.parent_id,
-                "username": username,
-                "avatar_url": avatar_url,
-                "body": body,
-                "created_at": c.created_at.isoformat() if c.created_at else None,
-                "likes_count": c.likes_count or 0,
-                "dislikes_count": c.dislikes_count or 0,
-                "replies": [],
-            }
-        }
+        db.flush()
+        return {"comment": _comment_to_dict(c=c, avatar_url=avatar_url, replies=[])}
 
 
 @app.post("/images/{image_page_id}/comments")
@@ -628,23 +658,7 @@ async def post_image_comment(image_page_id: str, req: CommentCreateRequest, requ
     avatar_url = generate_and_upload_avatar(username)
 
     with get_db() as db:
-        # Try to find image page by ID
         img = db.query(ImagePage).filter(ImagePage.id == image_page_id).first()
-        
-        # If not found, try treating image_page_id as document_id and look for page 1
-        if not img:
-            # Check if it looks like a document_id (no _page_ suffix)
-            if "_page_" not in image_page_id:
-                # Try to find the first page for this document
-                img = db.query(ImagePage).filter(
-                    ImagePage.document_id == image_page_id,
-                    ImagePage.page_number == 1
-                ).first()
-                if img:
-                    # Use the actual image_page_id
-                    image_page_id = img.id
-                    logger.info(f"Resolved document_id {image_page_id} to image_page_id {img.id}")
-        
         if not img:
             raise HTTPException(status_code=404, detail=f"Image page {image_page_id} not found")
 
@@ -659,26 +673,8 @@ async def post_image_comment(image_page_id: str, req: CommentCreateRequest, requ
             ip_hash=_ip_hash(request),
         )
         db.add(c)
-        db.flush()  # Flush to get the ID and created_at
-        db.refresh(c)  # Refresh to ensure we have all fields
-        
-        return {
-            "comment": {
-                "id": c.id,
-                "target_type": c.target_type,
-                "document_id": c.document_id,
-                "page_number": c.page_number,
-                "image_page_id": c.image_page_id,
-                "parent_id": c.parent_id,
-                "username": username,
-                "avatar_url": avatar_url,
-                "body": body,
-                "created_at": c.created_at.isoformat() if c.created_at else None,
-                "likes_count": c.likes_count or 0,
-                "dislikes_count": c.dislikes_count or 0,
-                "replies": [],
-            }
-        }
+        db.flush()
+        return {"comment": _comment_to_dict(c=c, avatar_url=avatar_url, replies=[])}
 
 
 @app.post("/comments/{comment_id}/replies")
@@ -716,25 +712,8 @@ async def post_reply(comment_id: str, req: ReplyCreateRequest, request: Request)
             ip_hash=_ip_hash(request),
         )
         db.add(r)
-        db.flush()  # Flush to get the ID and created_at
-        db.refresh(r)  # Refresh to ensure we have all fields
-        
-        return {
-            "reply": {
-                "id": r.id,
-                "target_type": r.target_type,
-                "document_id": r.document_id,
-                "page_number": r.page_number,
-                "image_page_id": r.image_page_id,
-                "parent_id": r.parent_id,
-                "username": username,
-                "avatar_url": avatar_url,
-                "body": body,
-                "created_at": r.created_at.isoformat() if r.created_at else None,
-                "likes_count": r.likes_count or 0,
-                "dislikes_count": r.dislikes_count or 0,
-            }
-        }
+        db.flush()
+        return {"reply": _comment_to_dict(c=r, avatar_url=avatar_url, replies=[])}
 
 
 @app.post("/comments/{comment_id}/like")
@@ -786,6 +765,12 @@ async def like_comment(comment_id: str, request: Request):
             "action": action,
             "likes_count": comment.likes_count or 0,
             "dislikes_count": comment.dislikes_count or 0,
+            # Backward/forward compatible shape for UIs expecting a nested comment object.
+            "comment": {
+                "id": comment_id,
+                "likes_count": comment.likes_count or 0,
+                "dislikes_count": comment.dislikes_count or 0,
+            },
         }
 
 
@@ -838,6 +823,284 @@ async def dislike_comment(comment_id: str, request: Request):
             "action": action,
             "likes_count": comment.likes_count or 0,
             "dislikes_count": comment.dislikes_count or 0,
+            # Backward/forward compatible shape for UIs expecting a nested comment object.
+            "comment": {
+                "id": comment_id,
+                "likes_count": comment.likes_count or 0,
+                "dislikes_count": comment.dislikes_count or 0,
+            },
+        }
+
+
+# -------------------------------------------------------------------
+# Compatibility aliases for frontends that use nested comment routes
+# -------------------------------------------------------------------
+
+@app.post("/images/{image_page_id}/comments/{comment_id}/replies")
+async def post_image_reply(image_page_id: str, comment_id: str, req: ReplyCreateRequest, request: Request):
+    """
+    Alias for POST /comments/{comment_id}/replies scoped to an image page.
+    """
+    from database import get_db
+    from models import Comment
+
+    username = _generate_random_username()
+    _rate_limit_comments_or_429(request)
+    body = (req.body or "").strip()
+    if not body:
+        raise HTTPException(status_code=400, detail="Reply body is required")
+    if len(body) > _comments_body_max_len():
+        raise HTTPException(status_code=400, detail="Reply body too long")
+
+    from comments.avatars import generate_and_upload_avatar
+    avatar_url = generate_and_upload_avatar(username)
+
+    with get_db() as db:
+        parent = db.query(Comment).filter(Comment.id == comment_id).first()
+        _ensure_comment_matches_context(comment=parent, expected_target_type="image", expected_image_page_id=image_page_id)
+        if parent.parent_id is not None:
+            raise HTTPException(status_code=400, detail="Cannot reply to a reply")
+
+        r = Comment(
+            target_type=parent.target_type,
+            document_id=parent.document_id,
+            page_number=parent.page_number,
+            image_page_id=parent.image_page_id,
+            parent_id=parent.id,
+            username=username,
+            body=body,
+            ip_hash=_ip_hash(request),
+        )
+        db.add(r)
+        db.flush()
+        return {"reply": _comment_to_dict(c=r, avatar_url=avatar_url, replies=[])}
+
+
+@app.post("/documents/{document_id}/comments/{comment_id}/replies")
+async def post_document_reply(document_id: str, comment_id: str, req: ReplyCreateRequest, request: Request):
+    """
+    Alias for POST /comments/{comment_id}/replies scoped to a document.
+    """
+    from database import get_db
+    from models import Comment
+
+    username = _generate_random_username()
+    _rate_limit_comments_or_429(request)
+    body = (req.body or "").strip()
+    if not body:
+        raise HTTPException(status_code=400, detail="Reply body is required")
+    if len(body) > _comments_body_max_len():
+        raise HTTPException(status_code=400, detail="Reply body too long")
+
+    from comments.avatars import generate_and_upload_avatar
+    avatar_url = generate_and_upload_avatar(username)
+
+    with get_db() as db:
+        parent = db.query(Comment).filter(Comment.id == comment_id).first()
+        _ensure_comment_matches_context(comment=parent, expected_target_type="document", expected_document_id=document_id)
+        if parent.parent_id is not None:
+            raise HTTPException(status_code=400, detail="Cannot reply to a reply")
+
+        r = Comment(
+            target_type=parent.target_type,
+            document_id=parent.document_id,
+            page_number=parent.page_number,
+            image_page_id=parent.image_page_id,
+            parent_id=parent.id,
+            username=username,
+            body=body,
+            ip_hash=_ip_hash(request),
+        )
+        db.add(r)
+        db.flush()
+        return {"reply": _comment_to_dict(c=r, avatar_url=avatar_url, replies=[])}
+
+
+@app.post("/images/{image_page_id}/comments/{comment_id}/like")
+async def like_image_comment(image_page_id: str, comment_id: str, request: Request):
+    """
+    Alias for POST /comments/{comment_id}/like scoped to an image page.
+    """
+    from database import get_db
+    from models import Comment
+
+    _rate_limit_comments_or_429(request)
+    ip_hash = _ip_hash(request)
+
+    with get_db() as db:
+        comment = db.query(Comment).filter(Comment.id == comment_id).first()
+        _ensure_comment_matches_context(comment=comment, expected_target_type="image", expected_image_page_id=image_page_id)
+
+        from models import CommentReaction
+        existing = db.query(CommentReaction).filter(
+            CommentReaction.comment_id == comment_id,
+            CommentReaction.ip_hash == ip_hash,
+        ).first()
+
+        if existing:
+            if existing.reaction_type == "like":
+                db.delete(existing)
+                comment.likes_count = max(0, (comment.likes_count or 0) - 1)
+                action = "removed"
+            else:
+                existing.reaction_type = "like"
+                comment.dislikes_count = max(0, (comment.dislikes_count or 0) - 1)
+                comment.likes_count = (comment.likes_count or 0) + 1
+                action = "changed_to_like"
+        else:
+            reaction = CommentReaction(comment_id=comment_id, reaction_type="like", ip_hash=ip_hash)
+            db.add(reaction)
+            comment.likes_count = (comment.likes_count or 0) + 1
+            action = "added"
+
+        db.flush()
+        return {
+            "comment_id": comment_id,
+            "action": action,
+            "likes_count": comment.likes_count or 0,
+            "dislikes_count": comment.dislikes_count or 0,
+            "comment": {"id": comment_id, "likes_count": comment.likes_count or 0, "dislikes_count": comment.dislikes_count or 0},
+        }
+
+
+@app.post("/images/{image_page_id}/comments/{comment_id}/dislike")
+async def dislike_image_comment(image_page_id: str, comment_id: str, request: Request):
+    """
+    Alias for POST /comments/{comment_id}/dislike scoped to an image page.
+    """
+    from database import get_db
+    from models import Comment
+
+    _rate_limit_comments_or_429(request)
+    ip_hash = _ip_hash(request)
+
+    with get_db() as db:
+        comment = db.query(Comment).filter(Comment.id == comment_id).first()
+        _ensure_comment_matches_context(comment=comment, expected_target_type="image", expected_image_page_id=image_page_id)
+
+        from models import CommentReaction
+        existing = db.query(CommentReaction).filter(
+            CommentReaction.comment_id == comment_id,
+            CommentReaction.ip_hash == ip_hash,
+        ).first()
+
+        if existing:
+            if existing.reaction_type == "dislike":
+                db.delete(existing)
+                comment.dislikes_count = max(0, (comment.dislikes_count or 0) - 1)
+                action = "removed"
+            else:
+                existing.reaction_type = "dislike"
+                comment.likes_count = max(0, (comment.likes_count or 0) - 1)
+                comment.dislikes_count = (comment.dislikes_count or 0) + 1
+                action = "changed_to_dislike"
+        else:
+            reaction = CommentReaction(comment_id=comment_id, reaction_type="dislike", ip_hash=ip_hash)
+            db.add(reaction)
+            comment.dislikes_count = (comment.dislikes_count or 0) + 1
+            action = "added"
+
+        db.flush()
+        return {
+            "comment_id": comment_id,
+            "action": action,
+            "likes_count": comment.likes_count or 0,
+            "dislikes_count": comment.dislikes_count or 0,
+            "comment": {"id": comment_id, "likes_count": comment.likes_count or 0, "dislikes_count": comment.dislikes_count or 0},
+        }
+
+
+@app.post("/documents/{document_id}/comments/{comment_id}/like")
+async def like_document_comment(document_id: str, comment_id: str, request: Request):
+    """
+    Alias for POST /comments/{comment_id}/like scoped to a document.
+    """
+    from database import get_db
+    from models import Comment
+
+    _rate_limit_comments_or_429(request)
+    ip_hash = _ip_hash(request)
+
+    with get_db() as db:
+        comment = db.query(Comment).filter(Comment.id == comment_id).first()
+        _ensure_comment_matches_context(comment=comment, expected_target_type="document", expected_document_id=document_id)
+
+        from models import CommentReaction
+        existing = db.query(CommentReaction).filter(
+            CommentReaction.comment_id == comment_id,
+            CommentReaction.ip_hash == ip_hash,
+        ).first()
+
+        if existing:
+            if existing.reaction_type == "like":
+                db.delete(existing)
+                comment.likes_count = max(0, (comment.likes_count or 0) - 1)
+                action = "removed"
+            else:
+                existing.reaction_type = "like"
+                comment.dislikes_count = max(0, (comment.dislikes_count or 0) - 1)
+                comment.likes_count = (comment.likes_count or 0) + 1
+                action = "changed_to_like"
+        else:
+            reaction = CommentReaction(comment_id=comment_id, reaction_type="like", ip_hash=ip_hash)
+            db.add(reaction)
+            comment.likes_count = (comment.likes_count or 0) + 1
+            action = "added"
+
+        db.flush()
+        return {
+            "comment_id": comment_id,
+            "action": action,
+            "likes_count": comment.likes_count or 0,
+            "dislikes_count": comment.dislikes_count or 0,
+            "comment": {"id": comment_id, "likes_count": comment.likes_count or 0, "dislikes_count": comment.dislikes_count or 0},
+        }
+
+
+@app.post("/documents/{document_id}/comments/{comment_id}/dislike")
+async def dislike_document_comment(document_id: str, comment_id: str, request: Request):
+    """
+    Alias for POST /comments/{comment_id}/dislike scoped to a document.
+    """
+    from database import get_db
+    from models import Comment
+
+    _rate_limit_comments_or_429(request)
+    ip_hash = _ip_hash(request)
+
+    with get_db() as db:
+        comment = db.query(Comment).filter(Comment.id == comment_id).first()
+        _ensure_comment_matches_context(comment=comment, expected_target_type="document", expected_document_id=document_id)
+
+        from models import CommentReaction
+        existing = db.query(CommentReaction).filter(
+            CommentReaction.comment_id == comment_id,
+            CommentReaction.ip_hash == ip_hash,
+        ).first()
+
+        if existing:
+            if existing.reaction_type == "dislike":
+                db.delete(existing)
+                comment.dislikes_count = max(0, (comment.dislikes_count or 0) - 1)
+                action = "removed"
+            else:
+                existing.reaction_type = "dislike"
+                comment.likes_count = max(0, (comment.likes_count or 0) - 1)
+                comment.dislikes_count = (comment.dislikes_count or 0) + 1
+                action = "changed_to_dislike"
+        else:
+            reaction = CommentReaction(comment_id=comment_id, reaction_type="dislike", ip_hash=ip_hash)
+            db.add(reaction)
+            comment.dislikes_count = (comment.dislikes_count or 0) + 1
+            action = "added"
+
+        db.flush()
+        return {
+            "comment_id": comment_id,
+            "action": action,
+            "likes_count": comment.likes_count or 0,
+            "dislikes_count": comment.dislikes_count or 0,
+            "comment": {"id": comment_id, "likes_count": comment.likes_count or 0, "dislikes_count": comment.dislikes_count or 0},
         }
 
 
@@ -921,30 +1184,20 @@ class ChatRequest(BaseModel):
 
 
 class Citation(BaseModel):
-    """A citation to a document passage or web article."""
+    """A citation to a document passage."""
     document_id: str
     page_id: Optional[str] = None
     page_number: int
     snippet: str
-    score: Optional[float] = None
-    file_url: str  # Can be document URL or news article URL
-    thumbnail_url: Optional[str] = None
-    title: Optional[str] = None  # For web articles
-    source: Optional[str] = None  # For web articles (domain name)
-    url: Optional[str] = None  # Original URL for web articles
-    open_url: Optional[str] = None  # Absolute URL a client can open in a new tab
-    is_web: bool = False
+    score: float
+    file_url: str
+    thumbnail_url: str
 
 
 class ChatResponse(BaseModel):
     """Response from chat API."""
     answer: str
-    answer_preview: Optional[str] = None  # Short preview for UI (read-more)
-    answer_full: Optional[str] = None  # Full answer text for UI expansion
-    has_more: Optional[bool] = None  # True if preview is truncated
     citations: List[Citation]
-    suggest_open_documents: Optional[bool] = None  # UI hint: show "Open X documents" CTA
-    suggested_documents: Optional[List[Dict[str, Any]]] = None  # UI hint payload
     debug: Optional[Dict[str, Any]] = None
 
 
@@ -993,26 +1246,14 @@ async def chat(request_body: ChatRequest, http_request: Request):
     top_k = min(request_body.top_k or 8, 20)  # Max 20 passages
     
     try:
-        # Retrieve passages (from both local documents and web news)
+        # Retrieve passages
         from chat.retriever import retrieve_passages
         
         search_type = request_body.search_type or "keyword"
         if search_type not in ["keyword", "phrase", "fuzzy", "semantic"]:
             search_type = "keyword"
         
-        all_citations = retrieve_passages(user_question, top_k=top_k, search_type=search_type, include_web=True)
-
-        def _is_news_intent(q: str) -> bool:
-            ql = (q or "").lower()
-            news_keywords = [
-                "latest", "recent", "today", "this week", "new", "developments", "updates",
-                "breaking", "news", "headlines", "current", "right now",
-            ]
-            return any(k in ql for k in news_keywords)
-
-        # If the user is asking for "latest/news" and we have web sources, prioritize web-only.
-        web_citations = [c for c in all_citations if c.get("url") or (isinstance(c.get("file_url"), str) and str(c.get("file_url")).startswith("http"))]
-        citations = web_citations if (_is_news_intent(user_question) and web_citations) else all_citations
+        citations = retrieve_passages(user_question, top_k=top_k, search_type=search_type)
         
         # Build conversation history (last N messages, excluding current question)
         conversation_history = []
@@ -1032,49 +1273,17 @@ async def chat(request_body: ChatRequest, http_request: Request):
             max_tokens=2000,
         )
         
-        def _wants_document_open_cta(q: str) -> bool:
-            ql = (q or "").lower()
-            keywords = [
-                "open", "find", "where", "show me", "which document", "which file",
-                "pdf", "document", "file", "download", "link", "source", "citation",
-                "ef ta", "efta", "exhibit", "page", "doc id", "document id",
-            ]
-            return any(k in ql for k in keywords)
-
-        def _absolutize(url_or_path: Optional[str]) -> Optional[str]:
-            if not url_or_path:
-                return None
-            s = str(url_or_path)
-            if s.startswith("http://") or s.startswith("https://"):
-                return s
-            # Convert relative path to absolute using incoming request base URL
-            try:
-                from urllib.parse import urljoin
-                base = str(http_request.base_url)
-                return urljoin(base, s.lstrip("/"))
-            except Exception:
-                return s
-
         # Map citations to response format
         citation_models = []
         for cit in citations:
-            is_web = bool(cit.get("url")) or (isinstance(cit.get("file_url"), str) and str(cit.get("file_url")).startswith("http"))
-            # Prefer explicit web URL; otherwise fall back to file_url (document endpoint path)
-            open_url = _absolutize(cit.get("url") or cit.get("file_url"))
-
             citation_models.append(Citation(
                 document_id=cit["document_id"],
                 page_id=cit.get("page_id"),
                 page_number=cit["page_number"],
                 snippet=cit["snippet"],
-                score=cit.get("score"),
+                score=cit["score"],
                 file_url=cit["file_url"],
-                thumbnail_url=cit.get("thumbnail_url"),
-                title=cit.get("title"),  # Web article title
-                source=cit.get("source"),  # Web article source
-                url=cit.get("url"),  # Web article URL
-                open_url=open_url,
-                is_web=bool(is_web),
+                thumbnail_url=cit["thumbnail_url"],
             ))
         
         # Build response - convert markdown to plain text if needed
@@ -1097,68 +1306,10 @@ async def chat(request_body: ChatRequest, http_request: Request):
                 answer_text = f"I found 1 document that mentions \"{user_question}\". See the citations below for details."
             else:
                 answer_text = f"I found {len(citation_models)} relevant passages across {len(doc_ids)} documents related to \"{user_question}\". See the citations below for details."
-
-        # If we used web citations, append explicit source URLs so the user can open them in a new tab
-        # even if the client UI doesn't render citation cards as links.
-        if citations:
-            web_sources = []
-            for c in citations:
-                u = c.get("url") or c.get("file_url")
-                if isinstance(u, str) and (u.startswith("http://") or u.startswith("https://")):
-                    title = c.get("title") or "Source"
-                    source = c.get("source")
-                    label = f"{title} ({source})" if source else str(title)
-                    web_sources.append((label, u))
-            if web_sources:
-                # De-dupe while preserving order
-                seen = set()
-                deduped = []
-                for label, u in web_sources:
-                    if u in seen:
-                        continue
-                    seen.add(u)
-                    deduped.append((label, u))
-                lines = ["", "Sources:"]
-                for (label, u) in deduped[:5]:
-                    lines.append(f"- {label}: {u}")
-                answer_text = (answer_text + "\n" + "\n".join(lines)).strip()
         
-        # Provide preview/full fields for "read more" UX.
-        # We keep `answer` as the full answer for backward compatibility, and also return preview fields.
-        preview_limit = 900
-        answer_full = answer_text or ""
-        answer_preview = answer_full
-        has_more = False
-        if len(answer_full) > preview_limit:
-            answer_preview = answer_full[:preview_limit].rstrip() + "…"
-            has_more = True
-
-        # UI hint: only suggest "Open X documents" CTA when user intent matches.
-        local_doc_ids = []
-        for cm in citation_models:
-            if not cm.is_web and cm.document_id:
-                local_doc_ids.append(cm.document_id)
-        unique_local_doc_ids = list(dict.fromkeys(local_doc_ids))  # stable unique
-
-        suggest_open = bool(unique_local_doc_ids) and _wants_document_open_cta(user_question)
-        suggested_docs_payload = None
-        if suggest_open:
-            suggested_docs_payload = [
-                {
-                    "document_id": did,
-                    "open_url": _absolutize(f"/files/{did}"),
-                }
-                for did in unique_local_doc_ids[:20]
-            ]
-
         response = ChatResponse(
-            answer=answer_full,
-            answer_preview=answer_preview,
-            answer_full=answer_full,
-            has_more=has_more,
+            answer=answer_text,
             citations=citation_models,
-            suggest_open_documents=suggest_open,
-            suggested_documents=suggested_docs_payload,
         )
         
         # Add debug info if requested
@@ -1183,7 +1334,7 @@ async def chat(request_body: ChatRequest, http_request: Request):
 async def get_stats():
     """Get system statistics."""
     from database import get_db
-    from models import Document, ImagePage, OCRText, Entity, SearchIndex, ImageLabel, DocumentSummary
+    from models import Document, ImagePage, OCRText, Entity, SearchIndex, ImageLabel
     
     try:
         with get_db() as db:
@@ -1201,24 +1352,6 @@ async def get_stats():
             
             processed_pages = db.query(ImagePage).filter(
                 ImagePage.ocr_processed == True
-            ).count()
-            
-            # Documents with OCR text (distinct document_ids)
-            docs_with_ocr = db.query(OCRText.document_id).distinct().count()
-            docs_without_ocr = doc_count - docs_with_ocr if doc_count > 0 else 0
-            
-            # Documents with successful summaries
-            docs_with_summaries = db.query(DocumentSummary).filter(
-                DocumentSummary.status == "succeeded"
-            ).count()
-            
-            # Documents with any summary row (including failed/pending)
-            docs_with_summary_row = db.query(DocumentSummary).count()
-            docs_without_summaries = doc_count - docs_with_summary_row if doc_count > 0 else 0
-            
-            # Documents with pending/failed summaries
-            docs_pending_summaries = db.query(DocumentSummary).filter(
-                DocumentSummary.status.in_(["pending", "failed"])
             ).count()
     except Exception as e:
         logger.exception(f"Stats query failed: {e}")
@@ -1247,58 +1380,7 @@ async def get_stats():
         "image_labels": label_count,
         "search_index_rows": search_index_count,
         "processed_pages": processed_pages,
-        "processing_rate": f"{processed_pages}/{page_count}" if page_count > 0 else "0/0",
-        "ocr_processing": {
-            "documents_with_ocr": docs_with_ocr,
-            "documents_without_ocr": docs_without_ocr,
-            "completion_percent": round(docs_with_ocr / doc_count * 100, 1) if doc_count > 0 else 0
-        },
-        "summary_processing": {
-            "documents_with_summaries": docs_with_summaries,
-            "documents_without_summaries": docs_without_summaries,
-            "documents_pending_summaries": docs_pending_summaries,
-            "completion_percent": round(docs_with_summaries / doc_count * 100, 1) if doc_count > 0 else 0
-        }
-    }
-
-
-@app.get("/stats/processing")
-async def get_processing_stats():
-    """Get lightweight processing statistics (documents with/without summaries, OCR)."""
-    from database import get_db
-    from models import Document, DocumentSummary, OCRText
-    from sqlalchemy import func
-    
-    try:
-        with get_db() as db:
-            # Total documents
-            total_docs = db.query(func.count(Document.id)).scalar()
-            
-            # Documents with successful summaries
-            docs_with_summaries = db.query(func.count(DocumentSummary.document_id)).filter(
-                DocumentSummary.status == "succeeded"
-            ).scalar()
-            
-            # Documents with any summary row
-            docs_with_summary_row = db.query(func.count(DocumentSummary.document_id)).scalar()
-            docs_without_summaries = total_docs - docs_with_summary_row if total_docs else 0
-            
-            # Documents with OCR text (distinct)
-            docs_with_ocr = db.query(func.count(func.distinct(OCRText.document_id))).scalar()
-            docs_without_ocr = total_docs - docs_with_ocr if total_docs else 0
-            
-    except Exception as e:
-        logger.exception(f"Processing stats query failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Database query failed: {str(e)}")
-    
-    return {
-        "total_documents": total_docs,
-        "documents_with_summaries": docs_with_summaries,
-        "documents_without_summaries": docs_without_summaries,
-        "documents_with_ocr": docs_with_ocr,
-        "documents_without_ocr": docs_without_ocr,
-        "summary_completion_percent": round(docs_with_summaries / total_docs * 100, 1) if total_docs > 0 else 0,
-        "ocr_completion_percent": round(docs_with_ocr / total_docs * 100, 1) if total_docs > 0 else 0
+        "processing_rate": f"{processed_pages}/{page_count}" if page_count > 0 else "0/0"
     }
 
 
@@ -1805,7 +1887,7 @@ async def get_file(document_id: str):
     from database import get_db
     from models import Document
 
-    def _get_or_refresh_presigned_url(doc: Document, key: str) -> str:
+    def _get_or_refresh_presigned_url(doc: Document, key: str, *, file_name: str, file_type: str) -> str:
         """
         Cache presigned URL in DB so repeated opens don't create a new URL each time.
         This stabilizes the URL so the browser can cache the PDF between opens.
@@ -1822,7 +1904,10 @@ async def get_file(document_id: str):
                 return doc.s3_presigned_url
 
         from storage.s3_assets import presign_get
-        url = presign_get(key)
+        disposition = f'inline; filename="{file_name}"' if file_name else "inline"
+        # Ensure PDFs render inline even if the S3 object has a wrong ContentType.
+        response_ct = "application/pdf" if file_type == "pdf" else None
+        url = presign_get(key, response_content_type=response_ct, response_content_disposition=disposition)
         doc.s3_presigned_url = url
         doc.s3_presigned_expires_at = now + timedelta(seconds=Config.S3_PRESIGN_EXPIRES_SECONDS)
         return url
@@ -1859,7 +1944,7 @@ async def get_file(document_id: str):
 
             # Fast path: if we already know the S3 key, skip HEAD checks and reuse cached presigned URL.
             if doc.s3_key_files:
-                url = _get_or_refresh_presigned_url(doc, doc.s3_key_files)
+                url = _get_or_refresh_presigned_url(doc, doc.s3_key_files, file_name=file_name, file_type=file_type)
                 return RedirectResponse(url=url, status_code=302)
 
             # Otherwise, do a ONE-TIME existence check to discover the canonical key and store it.
@@ -1869,7 +1954,7 @@ async def get_file(document_id: str):
 
             try:
                 s3.head_object(Bucket=Config.S3_BUCKET, Key=computed_key)
-                url = _get_or_refresh_presigned_url(doc, computed_key)
+                url = _get_or_refresh_presigned_url(doc, computed_key, file_name=file_name, file_type=file_type)
                 return RedirectResponse(url=url, status_code=302)
             except Exception:
                 pass
@@ -1887,7 +1972,7 @@ async def get_file(document_id: str):
                     ContentType=content_type,
                     CacheControl="public, max-age=31536000",
                 )
-                url = _get_or_refresh_presigned_url(doc, computed_key)
+                url = _get_or_refresh_presigned_url(doc, computed_key, file_name=file_name, file_type=file_type)
                 return RedirectResponse(url=url, status_code=302)
             except Exception as e:
                 logger.error(f"Failed to fetch+upload file for {document_id}: {e}")
@@ -2153,26 +2238,6 @@ async def list_files(
     Example: GET /files?limit=20&offset=0
     """
     return await search_files(q=None, has_text=None, limit=limit, offset=offset)
-
-
-@app.get("/username/random")
-async def get_random_username():
-    """
-    Generate a random Kahoot-style username for preview.
-    
-    Returns:
-    - username: Random username (e.g., "RetiredMonkey")
-    - avatar_url: URL to the avatar image for this username
-    """
-    from comments.avatars import get_avatar_url
-    
-    username = _generate_random_username()
-    avatar_url = get_avatar_url(username)
-    
-    return {
-        "username": username,
-        "avatar_url": avatar_url
-    }
 
 
 @app.get("/avatars/{username}")
@@ -2608,26 +2673,6 @@ async def process_celebrities(
 _doj_ingestion_task = None
 _doj_pause_event = None
 
-
-def _ensure_ingestion_state_row(name: str = "doj"):
-    """
-    Ensure the durable ingestion_state row exists.
-    This allows status/control to survive API restarts.
-    """
-    try:
-        from database import get_db
-        from models import IngestionState
-
-        with get_db() as db:
-            st = db.query(IngestionState).filter(IngestionState.name == name).first()
-            if st is None:
-                st = IngestionState(name=name, enabled=True, paused=False)
-                db.add(st)
-                db.flush()
-    except Exception as e:
-        # Don't block API startup or ingestion due to best-effort state init.
-        logger.warning(f"Failed to ensure ingestion_state row for {name}: {e}")
-
 class DOJIngestionResponse(BaseModel):
     """Response for DOJ file ingestion."""
     status: str
@@ -2880,16 +2925,6 @@ async def pause_doj_ingestion():
         _doj_pause_event = _asyncio.Event()
         _doj_pause_event.set()
     _doj_pause_event.clear()
-    _ensure_ingestion_state_row("doj")
-    try:
-        from database import get_db
-        from models import IngestionState
-        with get_db() as db:
-            st = db.query(IngestionState).filter(IngestionState.name == "doj").first()
-            if st:
-                st.paused = True
-    except Exception as e:
-        logger.warning(f"Failed to persist DOJ paused state: {e}")
     return {"status": "paused", "message": "DOJ ingestion paused (will pause between files)."}
 
 
@@ -2901,17 +2936,6 @@ async def resume_doj_ingestion():
     if _doj_pause_event is None:
         _doj_pause_event = _asyncio.Event()
     _doj_pause_event.set()
-    _ensure_ingestion_state_row("doj")
-    try:
-        from database import get_db
-        from models import IngestionState
-        with get_db() as db:
-            st = db.query(IngestionState).filter(IngestionState.name == "doj").first()
-            if st:
-                st.paused = False
-                st.enabled = True
-    except Exception as e:
-        logger.warning(f"Failed to persist DOJ resumed state: {e}")
     return {"status": "running", "message": "DOJ ingestion resumed."}
 
 
@@ -2921,30 +2945,7 @@ async def status_doj_ingestion():
     global _doj_ingestion_task, _doj_pause_event
     running = _doj_ingestion_task is not None and not _doj_ingestion_task.done()
     paused = (_doj_pause_event is not None) and (not _doj_pause_event.is_set())
-    # Durable state (if DOJ service is running, this is the source of truth)
-    durable = {}
-    try:
-        from database import get_db
-        from models import IngestionState
-        with get_db() as db:
-            st = db.query(IngestionState).filter(IngestionState.name == "doj").first()
-            if st:
-                durable = {
-                    "enabled": bool(st.enabled),
-                    "paused": bool(st.paused),
-                    "last_heartbeat_at": st.last_heartbeat_at.isoformat() if st.last_heartbeat_at else None,
-                    "last_run_started_at": st.last_run_started_at.isoformat() if st.last_run_started_at else None,
-                    "last_run_completed_at": st.last_run_completed_at.isoformat() if st.last_run_completed_at else None,
-                    "last_error": st.last_error,
-                }
-    except Exception as e:
-        logger.warning(f"Failed to read durable DOJ status: {e}")
-
-    return {
-        "running": bool(running),
-        "paused": bool(paused),
-        "durable": durable or None,
-    }
+    return {"running": bool(running), "paused": bool(paused)}
 
 
 @app.get("/ingest/doj/preview")
