@@ -279,36 +279,3 @@ class CommentReaction(Base):
         Index("idx_comment_reactions_comment_ip", "comment_id", "ip_hash", unique=True),
     )
 
-
-class IngestionState(Base):
-    """
-    Durable ingestion control/status for long-running ingestion jobs.
-
-    This replaces in-memory flags inside the API process so restarts do not lose state.
-    """
-    __tablename__ = "ingestion_state"
-
-    # e.g. "doj"
-    name = Column(String, primary_key=True)
-
-    enabled = Column(Boolean, default=True, nullable=False)
-    paused = Column(Boolean, default=False, nullable=False)
-
-    # Heartbeat / timestamps
-    last_heartbeat_at = Column(DateTime, nullable=True, index=True)
-    last_run_started_at = Column(DateTime, nullable=True)
-    last_run_completed_at = Column(DateTime, nullable=True)
-
-    # Best-effort error reporting
-    last_error = Column(Text, nullable=True)
-
-    # Optional lease fields (for safety if desired_count > 1)
-    lease_owner = Column(String, nullable=True)
-    lease_expires_at = Column(DateTime, nullable=True, index=True)
-
-    updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), index=True)
-
-    __table_args__ = (
-        Index("idx_ingestion_state_enabled_paused", "enabled", "paused"),
-    )
-

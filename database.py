@@ -93,51 +93,6 @@ def init_db():
                 conn.execute(text("ALTER TABLE comments ADD COLUMN IF NOT EXISTS dislikes_count INTEGER DEFAULT 0 NOT NULL"))
     except Exception as e:
         logger.warning(f"Comments reaction columns migration skipped/failed: {e}")
-
-    # Create ingestion_state table (create_all handles new tables, but keep this as an explicit
-    # additive migration in case the process runs with restricted create privileges).
-    try:
-        dialect = engine.dialect.name
-        with engine.begin() as conn:
-            if dialect == "sqlite":
-                conn.execute(
-                    text(
-                        "CREATE TABLE IF NOT EXISTS ingestion_state ("
-                        "name TEXT PRIMARY KEY,"
-                        "enabled INTEGER NOT NULL DEFAULT 1,"
-                        "paused INTEGER NOT NULL DEFAULT 0,"
-                        "last_heartbeat_at TIMESTAMP,"
-                        "last_run_started_at TIMESTAMP,"
-                        "last_run_completed_at TIMESTAMP,"
-                        "last_error TEXT,"
-                        "lease_owner TEXT,"
-                        "lease_expires_at TIMESTAMP,"
-                        "updated_at TIMESTAMP"
-                        ")"
-                    )
-                )
-            elif dialect == "postgresql":
-                conn.execute(
-                    text(
-                        "CREATE TABLE IF NOT EXISTS ingestion_state ("
-                        "name TEXT PRIMARY KEY,"
-                        "enabled BOOLEAN NOT NULL DEFAULT TRUE,"
-                        "paused BOOLEAN NOT NULL DEFAULT FALSE,"
-                        "last_heartbeat_at TIMESTAMP,"
-                        "last_run_started_at TIMESTAMP,"
-                        "last_run_completed_at TIMESTAMP,"
-                        "last_error TEXT,"
-                        "lease_owner TEXT,"
-                        "lease_expires_at TIMESTAMP,"
-                        "updated_at TIMESTAMP"
-                        ")"
-                    )
-                )
-            else:
-                # Best-effort: rely on create_all
-                pass
-    except Exception as e:
-        logger.warning(f"Ingestion state table migration skipped/failed: {e}")
     
     ensure_db_indexes()
     # Seed tag taxonomy if needed
