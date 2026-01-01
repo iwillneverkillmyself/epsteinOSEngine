@@ -56,6 +56,45 @@ def _ip_hash(request) -> str:
 # Best-effort in-memory rate limiter (per ECS task).
 _COMMENTS_RATE_STATE: Dict[str, Dict[str, float]] = {}
 
+#
+# Best-effort in-memory presign cache (per ECS task).
+# This avoids an AWS call to generate a new presigned URL on every asset request.
+#
+_PRESIGN_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _presign_cached(
+    *,
+    key: str,
+    expires_seconds: Optional[int] = None,
+    response_content_type: Optional[str] = None,
+    response_content_disposition: Optional[str] = None,
+) -> str:
+    """
+    Cache presigned URLs in-process. This improves repeated opens of images/PDFs/thumbnails.
+    """
+    if expires_seconds is None:
+        expires_seconds = int(getattr(Config, "S3_PRESIGN_EXPIRES_SECONDS", 3600))
+    expires_seconds = max(60, int(expires_seconds))
+
+    cache_key = f"{key}|ct={response_content_type or ''}|cd={response_content_disposition or ''}|exp={expires_seconds}"
+    now = time.time()
+    hit = _PRESIGN_CACHE.get(cache_key)
+    if hit and hit.get("exp_ts", 0) > now:
+        return hit["url"]
+
+    from storage.s3_assets import presign_get
+
+    url = presign_get(
+        key,
+        expires_seconds=expires_seconds,
+        response_content_type=response_content_type,
+        response_content_disposition=response_content_disposition,
+    )
+    # Refresh a bit early so clients don’t get an about-to-expire URL.
+    _PRESIGN_CACHE[cache_key] = {"url": url, "exp_ts": now + max(30, expires_seconds - 30)}
+    return url
+
 
 def _comments_rate_limit_per_minute() -> int:
     try:
@@ -1677,9 +1716,13 @@ async def get_image(page_id: str):
 
     # If running on ECS/Fargate, images should be on S3 (local disk is ephemeral).
     if Config.S3_BUCKET:
-        from storage.s3_assets import presign_get
         key = f"{Config.S3_IMAGES_PREFIX.rstrip('/')}/{page_id}.png"
-        return RedirectResponse(url=presign_get(key), status_code=302)
+        url = _presign_cached(key=key)
+        return RedirectResponse(
+            url=url,
+            status_code=302,
+            headers={"Cache-Control": "private, max-age=300"},
+        )
 
     raise HTTPException(status_code=404, detail=f"Image file not found: {image_path}")
 
@@ -1724,8 +1767,12 @@ async def get_thumbnail(
                 thumb_key = f"thumbnails/{page_id}_w{width}.png"
                 try:
                     s3.head_object(Bucket=Config.S3_BUCKET, Key=thumb_key)
-                    from storage.s3_assets import presign_get
-                    return RedirectResponse(url=presign_get(thumb_key), status_code=302)
+                    url = _presign_cached(key=thumb_key)
+                    return RedirectResponse(
+                        url=url,
+                        status_code=302,
+                        headers={"Cache-Control": "private, max-age=300"},
+                    )
                 except Exception:
                     pass
 
@@ -2305,7 +2352,12 @@ async def get_file_thumbnail(
             # Serve from cache if present
             try:
                 s3.head_object(Bucket=Config.S3_BUCKET, Key=thumb_key)
-                return RedirectResponse(url=presign_get(thumb_key), status_code=302)
+                url = _presign_cached(key=thumb_key)
+                return RedirectResponse(
+                    url=url,
+                    status_code=302,
+                    headers={"Cache-Control": "private, max-age=300"},
+                )
             except Exception:
                 pass
 
