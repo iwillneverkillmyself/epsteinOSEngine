@@ -1,7 +1,7 @@
 """FastAPI application for OCR RAG search."""
-from fastapi import FastAPI, HTTPException, Query, Request, Depends
+from fastapi import FastAPI, HTTPException, Query, Request, Depends, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse, RedirectResponse
+from fastapi.responses import FileResponse, StreamingResponse, RedirectResponse, JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from pydantic import BaseModel, root_validator
@@ -16,6 +16,7 @@ import os
 import hmac
 import hashlib
 import time
+import json
 from search.searcher import SearchEngine
 from config import Config
 from database import init_db
@@ -94,6 +95,53 @@ def _presign_cached(
     # Refresh a bit early so clients don’t get an about-to-expire URL.
     _PRESIGN_CACHE[cache_key] = {"url": url, "exp_ts": now + max(30, expires_seconds - 30)}
     return url
+
+
+# Tag category caching (small, rarely changing)
+_TAG_CATEGORIES_CACHE: Dict[str, Any] = {"ts": 0.0, "etag": None, "items": None, "labels": None}
+
+
+def _tag_categories_cache_ttl_seconds() -> int:
+    try:
+        return int(os.getenv("TAG_CATEGORIES_CACHE_TTL_SECONDS", "300"))
+    except Exception:
+        return 300
+
+
+def _compute_etag(obj: Any) -> str:
+    payload = json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _get_tag_categories_cached() -> Dict[str, Any]:
+    """
+    Returns { items: [{id,label}], labels: {id: label}, etag: str }.
+    Uses an in-memory cache with TTL to avoid DB hits on every request.
+    """
+    now = time.time()
+    ttl = max(1, _tag_categories_cache_ttl_seconds())
+    if (
+        _TAG_CATEGORIES_CACHE.get("items") is not None
+        and _TAG_CATEGORIES_CACHE.get("etag") is not None
+        and _TAG_CATEGORIES_CACHE.get("labels") is not None
+        and (now - float(_TAG_CATEGORIES_CACHE.get("ts", 0.0))) < ttl
+    ):
+        return {
+            "items": _TAG_CATEGORIES_CACHE["items"],
+            "labels": _TAG_CATEGORIES_CACHE["labels"],
+            "etag": _TAG_CATEGORIES_CACHE["etag"],
+        }
+
+    from database import get_db
+    from models import TagCategory
+
+    with get_db() as db:
+        rows = db.query(TagCategory.id, TagCategory.label).order_by(TagCategory.label.asc()).all()
+    items = [{"id": r[0], "label": r[1]} for r in rows]
+    labels = {r[0]: r[1] for r in rows}
+    etag = _compute_etag(items)
+    _TAG_CATEGORIES_CACHE.update({"ts": now, "etag": etag, "items": items, "labels": labels})
+    return {"items": items, "labels": labels, "etag": etag}
 
 
 def _comments_rate_limit_per_minute() -> int:
@@ -2102,7 +2150,7 @@ async def get_document_tags(document_id: str):
     IMPORTANT: Never invokes Bedrock; only returns cached DB results.
     """
     from database import get_db
-    from models import DocumentTag, TagCategory
+    from models import DocumentTag
 
     with get_db() as db:
         tags = (
@@ -2110,7 +2158,7 @@ async def get_document_tags(document_id: str):
             .filter(DocumentTag.document_id == document_id)
             .all()
         )
-        labels = {r[0]: r[1] for r in db.query(TagCategory.id, TagCategory.label).all()}
+    labels = _get_tag_categories_cached()["labels"]
 
     return {
         "document_id": document_id,
@@ -2124,6 +2172,26 @@ async def get_document_tags(document_id: str):
             for t in tags
         ],
     }
+
+
+@app.get("/tag-categories")
+async def list_tag_categories(request: Request):
+    """
+    Return the approved tag taxonomy (stable, small).
+    Designed to be prefetched at boot/login and cached aggressively client-side.
+    """
+    cached = _get_tag_categories_cached()
+    etag = cached["etag"]
+    inm = request.headers.get("if-none-match")
+    headers = {
+        "ETag": etag,
+        # Safe because this endpoint is keyed by API key (if enabled) and data is non-sensitive.
+        # Keep it "private" to avoid any shared cache mixing auth contexts.
+        "Cache-Control": "private, max-age=3600",
+    }
+    if inm and inm == etag:
+        return Response(status_code=304, headers=headers)
+    return JSONResponse(content={"tag_categories": cached["items"]}, headers=headers)
 
 
 # ============================================
