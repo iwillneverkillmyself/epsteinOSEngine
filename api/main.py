@@ -1944,6 +1944,23 @@ async def get_image(page_id: str):
     return _serve_image_by_id(page_id)
 
 
+@app.get("/images/{page_id}/share")
+async def get_image_share_url(page_id: str):
+    """
+    Returns a share link for a specific image page.
+    Intended for the Photos app so it can share a photo without exposing per-page share URLs in document listings.
+    """
+    from database import get_db
+    from models import ImagePage
+
+    page_id = page_id.replace(".png", "").replace(".jpg", "")
+    with get_db() as db:
+        page = db.query(ImagePage).filter(ImagePage.id == page_id).first()
+        if not page:
+            raise HTTPException(status_code=404, detail=f"Image page {page_id} not found")
+    return {"page_id": page_id, "share_url": _share_path("i", page_id)}
+
+
 @app.get("/thumbnails/{page_id}")
 async def get_thumbnail(
     page_id: str,
@@ -2283,7 +2300,6 @@ async def get_document_pages(document_id: str):
                     "width": page.width,
                     "height": page.height,
                     "image_url": f"/images/{page.id}",
-                    "share_url": _share_path("i", page.id),
                 }
                 for page in pages
             ]
@@ -2504,7 +2520,6 @@ async def search_files(
                             "page_number": page.page_number,
                             "image_url": f"/images/{page.id}",
                             "thumbnail_url": f"/thumbnails/{page.id}",
-                            "share_url": _share_path("i", page.id),
                         }
                         for page in pages
                     ]
