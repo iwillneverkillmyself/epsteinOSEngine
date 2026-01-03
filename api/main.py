@@ -1,7 +1,7 @@
 """FastAPI application for OCR RAG search."""
 from fastapi import FastAPI, HTTPException, Query, Request, Depends, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse, RedirectResponse, JSONResponse
+from fastapi.responses import FileResponse, StreamingResponse, RedirectResponse, JSONResponse, HTMLResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from pydantic import BaseModel, root_validator
@@ -17,6 +17,7 @@ import hmac
 import hashlib
 import time
 import json
+import base64
 from search.searcher import SearchEngine
 from config import Config
 from database import init_db
@@ -144,6 +145,62 @@ def _get_tag_categories_cached() -> Dict[str, Any]:
     return {"items": items, "labels": labels, "etag": etag}
 
 
+# -------------------------------------------------------------------
+# Public share links (stateless HMAC-signed tokens)
+# -------------------------------------------------------------------
+
+def _share_secret() -> str:
+    # Required in production. In dev, fall back so local testing works.
+    return os.getenv("SHARE_LINK_SECRET", "dev-share-secret")
+
+
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
+
+
+def _b64url_decode(s: str) -> bytes:
+    pad = "=" * ((4 - (len(s) % 4)) % 4)
+    return base64.urlsafe_b64decode((s + pad).encode("utf-8"))
+
+
+def _share_sign(payload: str) -> str:
+    return hmac.new(_share_secret().encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _share_token(kind: str, target_id: str) -> str:
+    """
+    Deterministic token for a given object so each file/photo has a stable share link.
+    kind: 'd' (document) or 'i' (image page)
+    """
+    payload = f"{kind}:{target_id}"
+    sig = _share_sign(payload)
+    return f"{_b64url_encode(payload.encode('utf-8'))}.{sig}"
+
+
+def _share_path(kind: str, target_id: str) -> str:
+    return f"/s/{_share_token(kind, target_id)}"
+
+
+def _share_verify(token: str) -> tuple[str, str]:
+    try:
+        payload_b64, sig = token.split(".", 1)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Invalid share token")
+    try:
+        payload = _b64url_decode(payload_b64).decode("utf-8")
+    except Exception:
+        raise HTTPException(status_code=404, detail="Invalid share token")
+    expected = _share_sign(payload)
+    if not hmac.compare_digest(expected, sig):
+        raise HTTPException(status_code=404, detail="Invalid share token")
+    if ":" not in payload:
+        raise HTTPException(status_code=404, detail="Invalid share token")
+    kind, target_id = payload.split(":", 1)
+    if kind not in ("d", "i") or not target_id:
+        raise HTTPException(status_code=404, detail="Invalid share token")
+    return kind, target_id
+
+
 def _comments_rate_limit_per_minute() -> int:
     try:
         return int(os.getenv("COMMENTS_RATE_LIMIT_PER_MINUTE", "20"))
@@ -180,6 +237,10 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: StarletteRequest, call_next):
         # Allow health check and root endpoint without auth
         if request.url.path in ["/health", "/"]:
+            return await call_next(request)
+
+        # Allow public share endpoints without auth.
+        if request.url.path.startswith("/s/") or request.url.path == "/s":
             return await call_next(request)
         
         # Allow OPTIONS requests (CORS preflight) without auth
@@ -306,6 +367,120 @@ async def root():
 async def health():
     """Health check endpoint."""
     return {"status": "healthy"}
+
+
+# ============================================
+# Public share links (landing page + OG card)
+# ============================================
+
+@app.get("/s/{token}")
+async def share_landing(token: str, request: Request):
+    kind, target_id = _share_verify(token)
+    base = str(request.base_url).rstrip("/")
+    share_url = f"{base}/s/{token}"
+    og_image_url = f"{base}/s/{token}/og.png"
+    open_url = f"{base}/s/{token}/open"
+
+    title = "epsteinOS"
+    subtitle = None
+
+    try:
+        from database import get_db
+        from models import Document, ImagePage
+
+        with get_db() as db:
+            if kind == "d":
+                doc = db.query(Document).filter(Document.id == target_id).first()
+                if not doc:
+                    raise HTTPException(status_code=404, detail="Not found")
+                title = f"epsteinOS — {doc.file_name}"
+                subtitle = doc.source_url
+            else:
+                page = db.query(ImagePage).filter(ImagePage.id == target_id).first()
+                if not page:
+                    raise HTTPException(status_code=404, detail="Not found")
+                doc = db.query(Document).filter(Document.id == page.document_id).first()
+                doc_name = doc.file_name if doc else page.document_id
+                title = f"epsteinOS — Photo (page {page.page_number})"
+                subtitle = doc_name
+    except HTTPException:
+        raise
+    except Exception:
+        # Keep landing page resilient: metadata still works even if DB lookup fails.
+        pass
+
+    description = "Shared via epsteinOS"
+    html = f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content="{description}" />
+    <meta property="og:site_name" content="epsteinOS" />
+    <meta property="og:title" content="{title}" />
+    <meta property="og:description" content="{description}" />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="{share_url}" />
+    <meta property="og:image" content="{og_image_url}" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="{title}" />
+    <meta name="twitter:description" content="{description}" />
+    <meta name="twitter:image" content="{og_image_url}" />
+    <style>
+      body {{ font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; margin: 0; background: #0b0f16; color: #e6edf3; }}
+      .wrap {{ max-width: 920px; margin: 0 auto; padding: 28px 18px 48px; }}
+      .brand {{ font-weight: 700; letter-spacing: 0.2px; opacity: 0.95; }}
+      .card {{ margin-top: 18px; background: #111827; border: 1px solid #22304a; border-radius: 14px; overflow: hidden; }}
+      .meta {{ padding: 16px 16px 10px; }}
+      .title {{ font-size: 18px; font-weight: 650; margin: 0; }}
+      .sub {{ margin-top: 6px; font-size: 13px; opacity: 0.7; word-break: break-word; }}
+      .preview {{ width: 100%; display: block; background: #0b0f16; }}
+      .actions {{ display: flex; gap: 10px; padding: 14px 16px 18px; }}
+      a.btn {{ display: inline-flex; align-items: center; justify-content: center; padding: 10px 12px; border-radius: 10px; text-decoration: none; font-weight: 600; }}
+      a.primary {{ background: #3b82f6; color: white; }}
+      a.secondary {{ background: transparent; color: #e6edf3; border: 1px solid #334155; }}
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="brand">epsteinOS</div>
+      <div class="card">
+        <img class="preview" src="/s/{token}/og.png" alt="Preview" />
+        <div class="meta">
+          <p class="title">{title}</p>
+          {f'<div class="sub">{subtitle}</div>' if subtitle else ''}
+        </div>
+        <div class="actions">
+          <a class="btn primary" href="/s/{token}/open">Open</a>
+          <a class="btn secondary" href="/s/{token}">Copy Link</a>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>"""
+    return HTMLResponse(content=html, headers={"Cache-Control": "private, max-age=300"})
+
+
+@app.get("/s/{token}/open")
+async def share_open(token: str):
+    kind, target_id = _share_verify(token)
+    if kind == "d":
+        return _serve_document_file_by_id(target_id)
+    return _serve_image_by_id(target_id)
+
+
+@app.get("/s/{token}/og.png")
+async def share_og_image(token: str):
+    """
+    A stable PNG used for social previews (Open Graph / Twitter card).
+    """
+    kind, target_id = _share_verify(token)
+    # Use a larger width for cards.
+    width = 1200
+    if kind == "d":
+        return await get_file_thumbnail(document_id=target_id, width=width)
+    return await get_thumbnail(page_id=target_id, width=width)
 
 
 @app.post("/search", response_model=SearchResponse)
@@ -1731,6 +1906,33 @@ async def process_labels(
 # File and Image Serving Endpoints
 # ============================================
 
+def _serve_image_by_id(page_id: str):
+    """
+    Shared helper for serving an ImagePage PNG (local dev or S3).
+    """
+    from database import get_db
+    from models import ImagePage
+
+    # Handle both with and without extension
+    page_id = page_id.replace(".png", "").replace(".jpg", "")
+
+    with get_db() as db:
+        page = db.query(ImagePage).filter(ImagePage.id == page_id).first()
+        if not page:
+            raise HTTPException(status_code=404, detail=f"Image page {page_id} not found")
+        image_path = Path(page.image_path)
+
+    if image_path.exists():
+        return FileResponse(path=image_path, media_type="image/png", filename=f"{page_id}.png")
+
+    if Config.S3_BUCKET:
+        key = f"{Config.S3_IMAGES_PREFIX.rstrip('/')}/{page_id}.png"
+        url = _presign_cached(key=key)
+        return RedirectResponse(url=url, status_code=302, headers={"Cache-Control": "private, max-age=300"})
+
+    raise HTTPException(status_code=404, detail=f"Image file not found: {image_path}")
+
+
 @app.get("/images/{page_id}")
 async def get_image(page_id: str):
     """
@@ -1739,40 +1941,7 @@ async def get_image(page_id: str):
     Example: GET /images/1b433488ca0ef07d_page_0001
     Returns: PNG image
     """
-    from database import get_db
-    from models import ImagePage
-    
-    # Handle both with and without .png extension
-    page_id = page_id.replace('.png', '').replace('.jpg', '')
-    
-    with get_db() as db:
-        page = db.query(ImagePage).filter(ImagePage.id == page_id).first()
-        if not page:
-            raise HTTPException(status_code=404, detail=f"Image page {page_id} not found")
-
-        # IMPORTANT: capture primitives before leaving session to avoid DetachedInstanceError
-        _document_id = page.document_id
-        _page_number = page.page_number
-        image_path = Path(page.image_path)
-    
-    if image_path.exists():
-        return FileResponse(
-            path=image_path,
-            media_type="image/png",
-            filename=f"{page_id}.png"
-        )
-
-    # If running on ECS/Fargate, images should be on S3 (local disk is ephemeral).
-    if Config.S3_BUCKET:
-        key = f"{Config.S3_IMAGES_PREFIX.rstrip('/')}/{page_id}.png"
-        url = _presign_cached(key=key)
-        return RedirectResponse(
-            url=url,
-            status_code=302,
-            headers={"Cache-Control": "private, max-age=300"},
-        )
-
-    raise HTTPException(status_code=404, detail=f"Image file not found: {image_path}")
+    return _serve_image_by_id(page_id)
 
 
 @app.get("/thumbnails/{page_id}")
@@ -1979,6 +2148,13 @@ async def get_file(document_id: str):
     Example: GET /files/1b433488ca0ef07d
     Returns: Original PDF file
     """
+    return _serve_document_file_by_id(document_id)
+
+
+def _serve_document_file_by_id(document_id: str):
+    """
+    Shared helper for serving a Document file (local dev or S3, with presigned redirects).
+    """
     from database import get_db
     from models import Document
 
@@ -2099,13 +2275,15 @@ async def get_document_pages(document_id: str):
         return {
             "document_id": document_id,
             "page_count": len(pages),
+            "share_url": _share_path("d", document_id),
             "pages": [
                 {
                     "page_id": page.id,
                     "page_number": page.page_number,
                     "width": page.width,
                     "height": page.height,
-                    "image_url": f"/images/{page.id}"
+                    "image_url": f"/images/{page.id}",
+                    "share_url": _share_path("i", page.id),
                 }
                 for page in pages
             ]
@@ -2317,6 +2495,7 @@ async def search_files(
                     "has_text": ocr is not None,
                     "preview_text": preview_text,
                     "file_url": f"/files/{doc.id}",
+                    "share_url": _share_path("d", doc.id),
                     # Always provide a doc-level thumbnail for list views (works even when pages/images aren't generated yet)
                     "thumbnail_url": f"/file-thumbnails/{doc.id}",
                     "pages": [
@@ -2324,7 +2503,8 @@ async def search_files(
                             "page_id": page.id,
                             "page_number": page.page_number,
                             "image_url": f"/images/{page.id}",
-                            "thumbnail_url": f"/thumbnails/{page.id}"
+                            "thumbnail_url": f"/thumbnails/{page.id}",
+                            "share_url": _share_path("i", page.id),
                         }
                         for page in pages
                     ]
