@@ -1906,6 +1906,38 @@ async def process_labels(
 # File and Image Serving Endpoints
 # ============================================
 
+_IMAGE_S3_KEY_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _resolve_s3_image_key(page_id: str) -> Optional[str]:
+    """
+    Best-effort: image pages may be stored as png/jpg/jpeg depending on the pipeline.
+    Cache the resolved key in-process to avoid repeated HEADs.
+    """
+    now = time.time()
+    hit = _IMAGE_S3_KEY_CACHE.get(page_id)
+    if hit and hit.get("exp_ts", 0) > now and hit.get("key"):
+        return hit["key"]
+
+    if not Config.S3_BUCKET:
+        return None
+    try:
+        import boto3
+        s3 = boto3.client("s3", region_name=Config.S3_REGION or "us-east-1")
+        base = f"{Config.S3_IMAGES_PREFIX.rstrip('/')}/{page_id}"
+        candidates = [f"{base}.png", f"{base}.jpg", f"{base}.jpeg"]
+        for k in candidates:
+            try:
+                s3.head_object(Bucket=Config.S3_BUCKET, Key=k)
+                _IMAGE_S3_KEY_CACHE[page_id] = {"key": k, "exp_ts": now + 3600}
+                return k
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+
 def _serve_image_by_id(page_id: str):
     """
     Shared helper for serving an ImagePage PNG (local dev or S3).
@@ -1923,10 +1955,11 @@ def _serve_image_by_id(page_id: str):
         image_path = Path(page.image_path)
 
     if image_path.exists():
+        # Let FileResponse infer the correct type from the file; default to png for consistency.
         return FileResponse(path=image_path, media_type="image/png", filename=f"{page_id}.png")
 
     if Config.S3_BUCKET:
-        key = f"{Config.S3_IMAGES_PREFIX.rstrip('/')}/{page_id}.png"
+        key = _resolve_s3_image_key(page_id) or f"{Config.S3_IMAGES_PREFIX.rstrip('/')}/{page_id}.png"
         url = _presign_cached(key=key)
         return RedirectResponse(url=url, status_code=302, headers={"Cache-Control": "private, max-age=300"})
 
