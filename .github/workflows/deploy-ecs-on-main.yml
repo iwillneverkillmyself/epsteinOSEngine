@@ -73,60 +73,61 @@ jobs:
             --force-new-deployment >/dev/null
 
           echo "Waiting for ECS services to become stable..."
-          if ! aws ecs wait services-stable \
+          if aws ecs wait services-stable \
             --region "${AWS_REGION}" \
             --cluster "${ECS_CLUSTER}" \
             --services "${ECS_SERVICE_API}" "${ECS_SERVICE_WORKER}" \
             --delay 15 \
             --max-attempts 80; then
-            echo ""
-            echo "ECS waiter timed out. Dumping service events and recent stopped-task reasons..."
-            echo ""
-
-            # If the waiter timed out but services are already steady, treat as success.
-            STEADY_JSON="$(aws ecs describe-services \
-              --region "${AWS_REGION}" \
-              --cluster "${ECS_CLUSTER}" \
-              --services "${ECS_SERVICE_API}" "${ECS_SERVICE_WORKER}" \
-              --query 'services[].{service:serviceName,status:status,desired:desiredCount,running:runningCount,pending:pendingCount,primaryRollout:deployments[?status==`PRIMARY`].rolloutState|[0],events:events[0:25].message}' \
-              --output json || true)"
-
-            echo "${STEADY_JSON}"
-
-            if STEADY_JSON="${STEADY_JSON}" python3 -c "import os, json, sys; raw=os.environ.get('STEADY_JSON','').strip(); services=json.loads(raw) if raw else []; ok=True; \
-for s in services: \
-  desired=int(s.get('desired',0) or 0); running=int(s.get('running',0) or 0); pending=int(s.get('pending',0) or 0); primary=str(s.get('primaryRollout') or '').upper(); \
-  ok = ok and (running==desired and pending==0 and (not primary or primary=='COMPLETED')); \
-sys.exit(0 if ok and services else 2)"; then
-            then
-              echo ""
-              echo "Services appear steady despite waiter timeout; treating deploy as successful."
-              exit 0
-            fi
-
-            for SVC in "${ECS_SERVICE_API}" "${ECS_SERVICE_WORKER}"; do
-              echo ""
-              echo "Recent STOPPED tasks for ${SVC}:"
-              TASKS="$(aws ecs list-tasks \
-                --region "${AWS_REGION}" \
-                --cluster "${ECS_CLUSTER}" \
-                --service-name "${SVC}" \
-                --desired-status STOPPED \
-                --query 'taskArns[0:10]' \
-                --output text || true)"
-              if [[ -z "${TASKS}" || "${TASKS}" == "None" ]]; then
-                echo "(none)"
-                continue
-              fi
-              aws ecs describe-tasks \
-                --region "${AWS_REGION}" \
-                --cluster "${ECS_CLUSTER}" \
-                --tasks ${TASKS} \
-                --query 'tasks[].{taskArn:taskArn,stoppedReason:stoppedReason,containers:containers[].{name:name,exitCode:exitCode,reason:reason}}' \
-                --output json || true
-            done
-
-            exit 1
+            echo "ECS services are stable."
+            exit 0
           fi
 
+          echo ""
+          echo "ECS waiter timed out. Checking if services are actually steady..."
+          echo ""
 
+          STEADY_JSON="$(aws ecs describe-services \
+            --region "${AWS_REGION}" \
+            --cluster "${ECS_CLUSTER}" \
+            --services "${ECS_SERVICE_API}" "${ECS_SERVICE_WORKER}" \
+            --query 'services[].{service:serviceName,desired:desiredCount,running:runningCount,pending:pendingCount,primaryRollout:deployments[?status==`PRIMARY`].rolloutState|[0]}' \
+            --output json || echo '[]')"
+
+          echo "${STEADY_JSON}"
+
+          # Use jq to check if all services are steady
+          NOT_STEADY_COUNT=$(echo "${STEADY_JSON}" | jq '[.[] | select(.running != .desired or .pending != 0 or (.primaryRollout != null and .primaryRollout != "COMPLETED"))] | length')
+
+          if [[ "${NOT_STEADY_COUNT}" == "0" ]]; then
+            echo ""
+            echo "Services appear steady despite waiter timeout; treating deploy as successful."
+            exit 0
+          fi
+
+          echo ""
+          echo "Services are NOT steady. Dumping debug info..."
+
+          for SVC in "${ECS_SERVICE_API}" "${ECS_SERVICE_WORKER}"; do
+            echo ""
+            echo "Recent STOPPED tasks for ${SVC}:"
+            TASKS="$(aws ecs list-tasks \
+              --region "${AWS_REGION}" \
+              --cluster "${ECS_CLUSTER}" \
+              --service-name "${SVC}" \
+              --desired-status STOPPED \
+              --query 'taskArns[0:10]' \
+              --output text || true)"
+            if [[ -z "${TASKS}" || "${TASKS}" == "None" ]]; then
+              echo "(none)"
+              continue
+            fi
+            aws ecs describe-tasks \
+              --region "${AWS_REGION}" \
+              --cluster "${ECS_CLUSTER}" \
+              --tasks ${TASKS} \
+              --query 'tasks[].{taskArn:taskArn,stoppedReason:stoppedReason,containers:containers[].{name:name,exitCode:exitCode,reason:reason}}' \
+              --output json || true
+          done
+
+          exit 1
