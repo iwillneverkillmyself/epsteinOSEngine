@@ -93,29 +93,11 @@ jobs:
 
             echo "${STEADY_JSON}"
 
-            if STEADY_JSON="${STEADY_JSON}" python3 - <<'PY'
-            import json, os, sys
-            raw = os.environ.get("STEADY_JSON", "").strip()
-            if not raw:
-                sys.exit(1)
-            services = json.loads(raw)
-            ok = True
-            for s in services:
-                desired = int(s.get("desired", 0) or 0)
-                running = int(s.get("running", 0) or 0)
-                pending = int(s.get("pending", 0) or 0)
-                primary = (s.get("primaryRollout") or "").upper()
-                if not (running == desired and pending == 0 and primary in ("COMPLETED", "IN_PROGRESS", "")):
-                    ok = False
-                    break
-            # Be conservative: require primary rollout completed for both if present.
-            for s in services:
-                primary = (s.get("primaryRollout") or "").upper()
-                if primary and primary != "COMPLETED":
-                    ok = False
-                    break
-            sys.exit(0 if ok else 2)
-PY
+            if STEADY_JSON="${STEADY_JSON}" python3 -c "import os, json, sys; raw=os.environ.get('STEADY_JSON','').strip(); services=json.loads(raw) if raw else []; ok=True; \
+for s in services: \
+  desired=int(s.get('desired',0) or 0); running=int(s.get('running',0) or 0); pending=int(s.get('pending',0) or 0); primary=str(s.get('primaryRollout') or '').upper(); \
+  ok = ok and (running==desired and pending==0 and (not primary or primary=='COMPLETED')); \
+sys.exit(0 if ok and services else 2)"; then
             then
               echo ""
               echo "Services appear steady despite waiter timeout; treating deploy as successful."
