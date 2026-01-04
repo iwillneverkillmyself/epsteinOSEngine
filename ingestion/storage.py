@@ -54,7 +54,7 @@ class DocumentStorage:
                 logger.debug(f"Document {doc_id} already exists, skipping storage")
                 return doc_id, False
             
-            # Copy file to storage
+            # Copy file to storage (local cache). In ECS/Fargate, this is ephemeral.
             source_path = Path(file_info['local_path'])
             stored_path = self.storage_dir / f"{doc_id}{source_path.suffix}"
             shutil.copy2(source_path, stored_path)
@@ -66,6 +66,11 @@ class DocumentStorage:
                     s3_key = f"{Config.S3_FILES_PREFIX.rstrip('/')}/{doc_id}{source_path.suffix}"
                     s3_client.upload_file(str(stored_path), Config.S3_BUCKET, s3_key)
                     logger.info(f"Uploaded document {doc_id} to S3: s3://{Config.S3_BUCKET}/{s3_key}")
+                    # Free local disk after successful upload (we can serve from S3 in ECS).
+                    try:
+                        stored_path.unlink(missing_ok=True)
+                    except Exception as e:
+                        logger.warning(f"Failed to delete local cached document {stored_path}: {e}")
                 except Exception as e:
                     logger.warning(f"Failed to upload document {doc_id} to S3: {e}")
             

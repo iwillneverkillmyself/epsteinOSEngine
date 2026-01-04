@@ -72,9 +72,47 @@ jobs:
             --service "${ECS_SERVICE_WORKER}" \
             --force-new-deployment >/dev/null
 
-          aws ecs wait services-stable \
+          echo "Waiting for ECS services to become stable..."
+          if ! aws ecs wait services-stable \
             --region "${AWS_REGION}" \
             --cluster "${ECS_CLUSTER}" \
-            --services "${ECS_SERVICE_API}" "${ECS_SERVICE_WORKER}"
+            --services "${ECS_SERVICE_API}" "${ECS_SERVICE_WORKER}" \
+            --delay 15 \
+            --max-attempts 80; then
+            echo ""
+            echo "ECS waiter timed out. Dumping service events and recent stopped-task reasons..."
+            echo ""
+
+            aws ecs describe-services \
+              --region "${AWS_REGION}" \
+              --cluster "${ECS_CLUSTER}" \
+              --services "${ECS_SERVICE_API}" "${ECS_SERVICE_WORKER}" \
+              --query 'services[].{service:serviceName,status:status,desired:desiredCount,running:runningCount,pending:pendingCount,deployments:deployments[].{status:status,desired:desiredCount,running:runningCount,pending:pendingCount,taskDefinition:taskDefinition},events:events[0:25].message}' \
+              --output json || true
+
+            for SVC in "${ECS_SERVICE_API}" "${ECS_SERVICE_WORKER}"; do
+              echo ""
+              echo "Recent STOPPED tasks for ${SVC}:"
+              TASKS="$(aws ecs list-tasks \
+                --region "${AWS_REGION}" \
+                --cluster "${ECS_CLUSTER}" \
+                --service-name "${SVC}" \
+                --desired-status STOPPED \
+                --query 'taskArns[0:10]' \
+                --output text || true)"
+              if [[ -z "${TASKS}" ]]; then
+                echo "(none)"
+                continue
+              fi
+              aws ecs describe-tasks \
+                --region "${AWS_REGION}" \
+                --cluster "${ECS_CLUSTER}" \
+                --tasks ${TASKS} \
+                --query 'tasks[].{taskArn:taskArn,stoppedReason:stoppedReason,containers:containers[].{name:name,exitCode:exitCode,reason:reason}}' \
+                --output json || true
+            done
+
+            exit 1
+          fi
 
 

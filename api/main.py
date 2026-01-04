@@ -3072,6 +3072,10 @@ async def ingest_doj_files(
         _doj_pause_event.set()  # not paused by default
     
     async def do_ingestion():
+        import os
+        import shutil
+        from pathlib import Path as _Path
+
         storage = DocumentStorage()
         # Force AWS Textract for DOJ ingestion (no silent fallback to Paddle/EasyOCR).
         textract = TextractEngine()
@@ -3087,6 +3091,17 @@ async def ingest_doj_files(
         
         temp_dir = Config.STORAGE_PATH / "doj_temp"
         temp_dir.mkdir(parents=True, exist_ok=True)
+
+        # Proactively clear previous partial downloads to avoid filling ephemeral disk on ECS.
+        # Safe because we can always re-download from DOJ and S3 persists the canonical copies.
+        try:
+            for child in list(temp_dir.iterdir()):
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
+        except Exception as e:
+            logger.warning(f"Failed to pre-clean DOJ temp dir {temp_dir}: {e}")
         
         errors = []
         files_processed = 0
@@ -3139,6 +3154,11 @@ async def ingest_doj_files(
                     
                         if not is_new and skip_existing:
                             logger.info(f"Document {doc_id} already exists, skipping")
+                            # Don't retain downloaded file if we're skipping.
+                            try:
+                                download_path.unlink(missing_ok=True)
+                            except Exception:
+                                pass
                             continue
                     
                         # Convert PDFs to images if needed
@@ -3185,11 +3205,36 @@ async def ingest_doj_files(
                         logger.info(f"Indexed {indexed} OCR texts for document {doc_id}")
                         
                         files_processed += 1
+
+                        # Cleanup local disk after successful end-to-end processing for this doc.
+                        # In ECS, S3 is the source of truth for PDFs/images; local copies are just cache.
+                        try:
+                            # Remove downloaded file
+                            download_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        try:
+                            # Remove temporary PDF->image conversions
+                            if "images_dir" in locals() and isinstance(images_dir, _Path):
+                                shutil.rmtree(images_dir, ignore_errors=True)
+                        except Exception:
+                            pass
+                        try:
+                            # Remove cached page images for this doc (they've already been uploaded to S3)
+                            for p in _Path(Config.IMAGES_PATH).glob(f"{doc_id}_page_*.png"):
+                                p.unlink(missing_ok=True)
+                        except Exception as e:
+                            logger.warning(f"Failed to cleanup local images for {doc_id}: {e}")
                     
                     except Exception as e:
                         error_msg = f"Error processing {file_info.get('filename', 'unknown')}: {str(e)}"
                         logger.error(error_msg)
                         errors.append(error_msg)
+                        # Best-effort cleanup to keep the task alive on ECS.
+                        try:
+                            download_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
                         continue
             
             logger.info(f"DOJ ingestion complete: {files_processed}/{len(files)} files processed")
