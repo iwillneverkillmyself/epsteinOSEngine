@@ -97,7 +97,8 @@ jobs:
           echo "${STEADY_JSON}"
 
           # Use jq to check if all services are steady
-          NOT_STEADY_COUNT=$(echo "${STEADY_JSON}" | jq '[.[] | select(.running != .desired or .pending != 0 or (.primaryRollout != null and .primaryRollout != "COMPLETED"))] | length')
+          # Accept COMPLETED or IN_PROGRESS (new tasks running, old draining) as valid states
+          NOT_STEADY_COUNT=$(echo "${STEADY_JSON}" | jq '[.[] | select(.running != .desired or .pending != 0 or (.primaryRollout != null and .primaryRollout != "COMPLETED" and .primaryRollout != "IN_PROGRESS"))] | length')
 
           if [[ "${NOT_STEADY_COUNT}" == "0" ]]; then
             echo ""
