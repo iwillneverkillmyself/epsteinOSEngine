@@ -1,0 +1,80 @@
+name: Deploy to ECS (push to main)
+
+on:
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-ecs-main
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPO: epsteingptengine
+  ECS_CLUSTER: epsteingptengine-cluster
+  ECS_SERVICE_API: epsteingptengine-service
+  ECS_SERVICE_WORKER: epsteingptengine-worker-service
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        shell: bash
+        run: |
+          set -euo pipefail
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          IMAGE_SHA="${GITHUB_SHA::7}"
+
+          IMAGE_SHA_TAG="${ECR_REGISTRY}/${ECR_REPO}:${IMAGE_SHA}"
+          IMAGE_LATEST_TAG="${ECR_REGISTRY}/${ECR_REPO}:latest"
+
+          echo "Building: ${IMAGE_SHA_TAG}"
+          docker build -t "${IMAGE_SHA_TAG}" .
+          docker tag "${IMAGE_SHA_TAG}" "${IMAGE_LATEST_TAG}"
+
+          echo "Pushing: ${IMAGE_SHA_TAG}"
+          docker push "${IMAGE_SHA_TAG}"
+          echo "Pushing: ${IMAGE_LATEST_TAG}"
+          docker push "${IMAGE_LATEST_TAG}"
+
+      - name: Force new ECS deployment (API + worker)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws ecs update-service \
+            --region "${AWS_REGION}" \
+            --cluster "${ECS_CLUSTER}" \
+            --service "${ECS_SERVICE_API}" \
+            --force-new-deployment >/dev/null
+
+          aws ecs update-service \
+            --region "${AWS_REGION}" \
+            --cluster "${ECS_CLUSTER}" \
+            --service "${ECS_SERVICE_WORKER}" \
+            --force-new-deployment >/dev/null
+
+          aws ecs wait services-stable \
+            --region "${AWS_REGION}" \
+            --cluster "${ECS_CLUSTER}" \
+            --services "${ECS_SERVICE_API}" "${ECS_SERVICE_WORKER}"
+
+

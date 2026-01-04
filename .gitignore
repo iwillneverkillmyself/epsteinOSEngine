@@ -57,6 +57,10 @@ models/
 *.tfstate
 *.tfstate.*
 .terraform.lock.hcl
+terraform.tfvars
+**/terraform.tfvars
+terraform.tfvars.json
+**/terraform.tfvars.json
 
 # API Keys and Secrets
 API_KEYS.md

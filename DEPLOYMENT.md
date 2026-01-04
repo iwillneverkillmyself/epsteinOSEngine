@@ -194,6 +194,51 @@ Template policy is in:
 - ALB DNS → `GET /health` should return `{"status":"healthy"}`
 - `GET /files/{document_id}` and `GET /images/{page_id}` should redirect to S3 presigned URLs (302)
 
+### (Optional) CI/CD: auto-build + auto-redeploy on every push to `main`
+
+This repo includes a GitHub Actions workflow that, on every push/merge to `main`:
+- builds the Docker image
+- pushes it to ECR (`:latest` + `:<short-sha>`)
+- forces a new ECS deployment for both the API service and the worker service
+
+Workflow file:
+- `.github/workflows/deploy-ecs-on-main.yml`
+
+#### 1) Create/verify a GitHub Actions OIDC provider in AWS
+
+In AWS IAM, ensure your account has an **OIDC provider** for GitHub Actions:
+- URL: `https://token.actions.githubusercontent.com`
+- Audience: `sts.amazonaws.com`
+
+(You only need to do this once per AWS account.)
+
+#### 2) Create the deploy role (Terraform option)
+
+If you’re using the Terraform stack in `infra/terraform/ecs-fargate`, you can create the GitHub Actions deploy role by setting:
+- `github_oidc_provider_arn` (required to enable the role)
+- `github_owner`
+- `github_repo`
+
+Then run `terraform apply`. Terraform will output:
+- `github_actions_deploy_role_arn`
+
+#### 3) Add the GitHub secret
+
+In your GitHub repo:
+- Settings → Secrets and variables → Actions → New repository secret
+- Name: `AWS_ROLE_TO_ASSUME`
+- Value: the role ARN from Terraform (`github_actions_deploy_role_arn`)
+
+#### 4) Confirm your ECS names match
+
+The workflow defaults assume the Terraform ECS names:
+- Cluster: `epsteingptengine-cluster`
+- API service: `epsteingptengine-service`
+- Worker service: `epsteingptengine-worker-service`
+- ECR repo: `epsteingptengine`
+
+If yours differ, edit the `env:` block inside `.github/workflows/deploy-ecs-on-main.yml`.
+
 ### Environment variables to set in ECS
 Minimum:
 ```env

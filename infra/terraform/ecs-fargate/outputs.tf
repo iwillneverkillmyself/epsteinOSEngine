@@ -30,16 +30,14 @@ output "comments_hmac_secret_ssm_param" {
   value = aws_ssm_parameter.comments_hmac_secret.name
 }
 
-output "master_api_key" {
-  value       = aws_ssm_parameter.master_api_key.value
-  sensitive   = true
-  description = "Master API key for all endpoints (also stored in SSM: /epsteingptengine/MASTER_API_KEY)"
+output "master_api_key_ssm_param" {
+  value       = aws_ssm_parameter.master_api_key.name
+  description = "SSM param name for the master API key (value is stored as SecureString)."
 }
 
-output "chat_api_key" {
-  value       = aws_ssm_parameter.chat_api_key.value
-  sensitive   = true
-  description = "Chat API key for /chat endpoint (also stored in SSM: /epsteingptengine/CHAT_API_KEY)"
+output "chat_api_key_ssm_param" {
+  value       = aws_ssm_parameter.chat_api_key.name
+  description = "SSM param name for the chat API key (value is stored as SecureString)."
 }
 
 

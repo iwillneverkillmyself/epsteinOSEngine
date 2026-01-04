@@ -110,6 +110,12 @@ resource "aws_codebuild_project" "build_image" {
       stream_name = "build"
     }
   }
+
+  # If you manually changed CodeBuild source in the console (e.g. to GitHub),
+  # this prevents Terraform from trying to flip it back and forth.
+  lifecycle {
+    ignore_changes = [source]
+  }
 }
 
 resource "aws_s3_bucket" "codebuild_source" {

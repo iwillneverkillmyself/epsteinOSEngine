@@ -26,7 +26,17 @@ rds_security_group_id = "sg-xxxxxxxxxxxxxxxxx"
 
 # IMPORTANT: put your real URL here
 database_url = "postgresql+psycopg2://postgres:YOUR_PASSWORD@database-1.ccxoasco2m9l.us-east-1.rds.amazonaws.com:5432/epsteingptengine?sslmode=require"
+
+# (Optional) GitHub Actions OIDC: enable auto-deploy on pushes to main
+# 1) Create IAM OIDC provider for https://token.actions.githubusercontent.com (audience: sts.amazonaws.com)
+# 2) Paste the provider ARN here:
+github_oidc_provider_arn = "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+github_owner  = "iwillneverkillmyself"
+github_repo   = "epsteinOSEngine"
+github_branch = "main"
 ```
+
+Tip: you can copy `terraform.tfvars.example` → `terraform.tfvars` and fill in values.
 
 ### 2) Apply
 
