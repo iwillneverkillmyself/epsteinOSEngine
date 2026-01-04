@@ -83,12 +83,44 @@ jobs:
             echo "ECS waiter timed out. Dumping service events and recent stopped-task reasons..."
             echo ""
 
-            aws ecs describe-services \
+            # If the waiter timed out but services are already steady, treat as success.
+            STEADY_JSON="$(aws ecs describe-services \
               --region "${AWS_REGION}" \
               --cluster "${ECS_CLUSTER}" \
               --services "${ECS_SERVICE_API}" "${ECS_SERVICE_WORKER}" \
-              --query 'services[].{service:serviceName,status:status,desired:desiredCount,running:runningCount,pending:pendingCount,deployments:deployments[].{status:status,desired:desiredCount,running:runningCount,pending:pendingCount,taskDefinition:taskDefinition},events:events[0:25].message}' \
-              --output json || true
+              --query 'services[].{service:serviceName,status:status,desired:desiredCount,running:runningCount,pending:pendingCount,primaryRollout:deployments[?status==`PRIMARY`].rolloutState|[0],events:events[0:25].message}' \
+              --output json || true)"
+
+            echo "${STEADY_JSON}"
+
+            if python3 - <<'PY'
+import json, os, sys
+raw = os.environ.get("STEADY_JSON", "").strip()
+if not raw:
+    sys.exit(1)
+services = json.loads(raw)
+ok = True
+for s in services:
+    desired = int(s.get("desired", 0) or 0)
+    running = int(s.get("running", 0) or 0)
+    pending = int(s.get("pending", 0) or 0)
+    primary = (s.get("primaryRollout") or "").upper()
+    if not (running == desired and pending == 0 and primary in ("COMPLETED", "IN_PROGRESS", "")):
+        ok = False
+        break
+# Be conservative: require primary rollout completed for both if present.
+for s in services:
+    primary = (s.get("primaryRollout") or "").upper()
+    if primary and primary != "COMPLETED":
+        ok = False
+        break
+sys.exit(0 if ok else 2)
+PY
+            then
+              echo ""
+              echo "Services appear steady despite waiter timeout; treating deploy as successful."
+              exit 0
+            fi
 
             for SVC in "${ECS_SERVICE_API}" "${ECS_SERVICE_WORKER}"; do
               echo ""
@@ -100,7 +132,7 @@ jobs:
                 --desired-status STOPPED \
                 --query 'taskArns[0:10]' \
                 --output text || true)"
-              if [[ -z "${TASKS}" ]]; then
+              if [[ -z "${TASKS}" || "${TASKS}" == "None" ]]; then
                 echo "(none)"
                 continue
               fi
