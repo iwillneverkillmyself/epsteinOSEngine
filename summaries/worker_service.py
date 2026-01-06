@@ -27,11 +27,15 @@ def get_next_document_ids(limit: int) -> list[str]:
     Designed for a single worker instance (desired_count=1).
     """
     with get_db() as db:
+        # Never summarize/tag deleted-collection docs (storage-only).
+        non_deleted = (Document.collection != "deleted") | (Document.collection.is_(None))
+
         # Documents with no summary row
         missing = (
             db.query(Document.id)
             .outerjoin(DocumentSummary, DocumentSummary.document_id == Document.id)
             .filter(DocumentSummary.document_id.is_(None))
+            .filter(non_deleted)
             .order_by(Document.ingested_at.desc())
             .limit(limit)
             .all()
@@ -44,8 +48,10 @@ def get_next_document_ids(limit: int) -> list[str]:
         cutoff = datetime.utcnow() - timedelta(minutes=cooldown_minutes)
         retry = (
             db.query(DocumentSummary.document_id)
+            .join(Document, Document.id == DocumentSummary.document_id)
             .filter(DocumentSummary.status.in_(["failed", "pending"]))
             .filter((DocumentSummary.updated_at.is_(None)) | (DocumentSummary.updated_at < cutoff))
+            .filter(non_deleted)
             .order_by(DocumentSummary.updated_at.asc().nullsfirst())
             .limit(limit)
             .all()

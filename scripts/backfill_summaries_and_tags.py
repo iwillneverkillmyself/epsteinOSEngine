@@ -40,6 +40,11 @@ def main():
         default=None,
         help="Filter by collection (e.g., 'deleted') - only process documents in this collection",
     )
+    parser.add_argument(
+        "--force-deleted",
+        action="store_true",
+        help="Allow processing collection=deleted (storage-only by default).",
+    )
     args = parser.parse_args()
 
     only_missing = args.only_missing.lower() in ("1", "true", "yes", "y")
@@ -49,7 +54,27 @@ def main():
         status, tags = summarize_and_tag_document(args.document_id)
         print(json.dumps({"document_id": args.document_id, "status": status, "tags": tags}, indent=2))
     else:
-        counts = backfill_documents(limit=args.limit, offset=args.offset, only_missing=only_missing, collection=args.collection)
+        if args.collection == "deleted" and not args.force_deleted:
+            print(
+                json.dumps(
+                    {
+                        "total": 0,
+                        "succeeded": 0,
+                        "failed": 0,
+                        "skipped": 0,
+                        "note": "collection=deleted is storage-only; pass --force-deleted to override",
+                    },
+                    indent=2,
+                )
+            )
+            return
+
+        counts = backfill_documents(
+            limit=args.limit,
+            offset=args.offset,
+            only_missing=only_missing,
+            collection=args.collection,
+        )
         print(json.dumps(counts, indent=2))
 
 
