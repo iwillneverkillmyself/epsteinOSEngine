@@ -90,7 +90,15 @@ def init_db():
                 conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS collection TEXT"))
             # Create index on collection if it doesn't exist
             if dialect == "sqlite":
-                indexes = [r[1] for r in conn.execute(text("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_collection'")).fetchall()]
+                indexes = [
+                    r[0]
+                    for r in conn.execute(
+                        text(
+                            "SELECT name FROM sqlite_master "
+                            "WHERE type='index' AND name='idx_collection'"
+                        )
+                    ).fetchall()
+                ]
                 if not indexes:
                     conn.execute(text("CREATE INDEX idx_collection ON documents(collection)"))
             elif dialect == "postgresql":
