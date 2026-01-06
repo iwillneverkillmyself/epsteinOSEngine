@@ -122,6 +122,11 @@ class DocumentStorage:
                 s3_key = f"{Config.S3_IMAGES_PREFIX.rstrip('/')}/{page_id}.png"
                 s3_client.upload_file(str(stored_image_path), Config.S3_BUCKET, s3_key)
                 logger.debug(f"Uploaded image page {page_id} to S3: s3://{Config.S3_BUCKET}/{s3_key}")
+                # Free local disk after successful upload (ECS/Fargate ephemeral storage).
+                try:
+                    stored_image_path.unlink(missing_ok=True)
+                except Exception as e:
+                    logger.warning(f"Failed to delete local cached image {stored_image_path}: {e}")
             except Exception as e:
                 logger.warning(f"Failed to upload image page {page_id} to S3: {e}")
         
