@@ -2280,21 +2280,50 @@ def _serve_document_file_by_id(document_id: str):
             except Exception:
                 pass
 
-            # Not in S3 under computed key: fetch from source_url, upload, store key, and redirect.
+            # Not in S3 under computed key: try to fetch from source_url, upload, store key, and redirect.
+            # Handle file:// URLs (local files) by reading from disk instead of HTTP
             try:
-                import httpx
-                resp = httpx.get(source_url, timeout=60.0, follow_redirects=True)
-                resp.raise_for_status()
-                content_type = "application/pdf" if ext == "pdf" else "application/octet-stream"
-                s3.put_object(
-                    Bucket=Config.S3_BUCKET,
-                    Key=computed_key,
-                    Body=resp.content,
-                    ContentType=content_type,
-                    CacheControl="public, max-age=31536000",
-                )
-                url = _get_or_refresh_presigned_url(doc, computed_key, file_name=file_name, file_type=file_type)
-                return RedirectResponse(url=url, status_code=302)
+                if source_url.startswith("file://"):
+                    # Local file - read from disk and upload to S3
+                    from pathlib import Path
+                    local_file_path = Path(source_url.replace("file://", ""))
+                    if not local_file_path.exists():
+                        raise FileNotFoundError(f"Local file not found: {local_file_path}")
+                    
+                    with open(local_file_path, 'rb') as f:
+                        file_content = f.read()
+                    
+                    content_type = "application/pdf" if ext == "pdf" else "application/octet-stream"
+                    s3.put_object(
+                        Bucket=Config.S3_BUCKET,
+                        Key=computed_key,
+                        Body=file_content,
+                        ContentType=content_type,
+                        CacheControl="public, max-age=31536000",
+                    )
+                    # Update the document with the S3 key
+                    doc.s3_key_files = computed_key
+                    db.commit()
+                    url = _get_or_refresh_presigned_url(doc, computed_key, file_name=file_name, file_type=file_type)
+                    return RedirectResponse(url=url, status_code=302)
+                else:
+                    # HTTP URL - fetch via HTTP
+                    import httpx
+                    resp = httpx.get(source_url, timeout=60.0, follow_redirects=True)
+                    resp.raise_for_status()
+                    content_type = "application/pdf" if ext == "pdf" else "application/octet-stream"
+                    s3.put_object(
+                        Bucket=Config.S3_BUCKET,
+                        Key=computed_key,
+                        Body=resp.content,
+                        ContentType=content_type,
+                        CacheControl="public, max-age=31536000",
+                    )
+                    # Update the document with the S3 key
+                    doc.s3_key_files = computed_key
+                    db.commit()
+                    url = _get_or_refresh_presigned_url(doc, computed_key, file_name=file_name, file_type=file_type)
+                    return RedirectResponse(url=url, status_code=302)
             except Exception as e:
                 logger.error(f"Failed to fetch+upload file for {document_id}: {e}")
                 raise HTTPException(status_code=404, detail="Document file not found in S3 and fetch failed")
@@ -2452,6 +2481,7 @@ class FileSearchResponse(BaseModel):
 async def search_files(
     q: Optional[str] = Query(None, description="Search query (filename or content)"),
     has_text: Optional[bool] = Query(None, description="Filter by whether file has extracted text"),
+    collection: Optional[str] = Query(None, description="Filter by collection (e.g., 'deleted')"),
     limit: int = Query(50, ge=1, le=10000),
     offset: int = Query(0, ge=0)
 ):
@@ -2512,6 +2542,10 @@ async def search_files(
                 else:
                     query = query.filter(~Document.id.in_(docs_with_text))
             
+            # Filter by collection if specified
+            if collection is not None:
+                query = query.filter(Document.collection == collection)
+            
             # Get total count before pagination
             total = query.count()
             
@@ -2562,7 +2596,8 @@ async def search_files(
                 "results": results,
                 "count": len(results),
                 "total": total,
-                "query": q
+                "query": q,
+                "collection": collection
             }
             
     except Exception as e:
@@ -2578,9 +2613,83 @@ async def list_files(
     """
     List all files/documents in the system with pagination.
     
+    Note: This endpoint excludes deleted files by default. Use /files/deleted to see deleted files.
+    
     Example: GET /files?limit=20&offset=0
     """
-    return await search_files(q=None, has_text=None, limit=limit, offset=offset)
+    # Exclude deleted files from main /files endpoint
+    from database import get_db
+    from models import Document
+    from sqlalchemy import or_
+    
+    with get_db() as db:
+        query = db.query(Document).filter(
+            or_(Document.collection != "deleted", Document.collection.is_(None))
+        )
+        total = query.count()
+        documents = query.order_by(Document.ingested_at.desc()).offset(offset).limit(limit).all()
+        
+        # Format response same as search_files
+        from models import ImagePage, OCRText
+        
+        results = []
+        for doc in documents:
+            pages = db.query(ImagePage).filter(
+                ImagePage.document_id == doc.id
+            ).order_by(ImagePage.page_number).all()
+            
+            ocr = db.query(OCRText).filter(
+                OCRText.document_id == doc.id
+            ).first()
+            
+            preview_text = None
+            if ocr and ocr.raw_text:
+                preview_text = ocr.raw_text[:200] + "..." if len(ocr.raw_text) > 200 else ocr.raw_text
+            
+            results.append({
+                "document_id": doc.id,
+                "file_name": doc.file_name,
+                "file_type": doc.file_type,
+                "source_url": doc.source_url,
+                "page_count": len(pages),
+                "ingested_at": doc.ingested_at.isoformat() if doc.ingested_at else None,
+                "has_text": ocr is not None,
+                "preview_text": preview_text,
+                "file_url": f"/files/{doc.id}",
+                "share_url": _share_path("d", doc.id),
+                "thumbnail_url": f"/file-thumbnails/{doc.id}",
+                "pages": [
+                    {
+                        "page_id": page.id,
+                        "page_number": page.page_number,
+                        "image_url": f"/images/{page.id}",
+                        "thumbnail_url": f"/thumbnails/{page.id}",
+                    }
+                    for page in pages
+                ]
+            })
+        
+        return {
+            "results": results,
+            "count": len(results),
+            "total": total,
+            "query": None
+        }
+
+
+@app.get("/files/deleted")
+async def list_deleted_files(
+    limit: int = Query(50, ge=1, le=10000),
+    offset: int = Query(0, ge=0)
+):
+    """
+    List all deleted/removed files in the system with pagination.
+    
+    This endpoint returns only files marked with collection="deleted".
+    
+    Example: GET /files/deleted?limit=20&offset=0
+    """
+    return await search_files(q=None, has_text=None, limit=limit, offset=offset, collection="deleted")
 
 
 @app.get("/avatars/{username}")

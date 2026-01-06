@@ -35,12 +35,13 @@ class DocumentStorage:
         content = f"{source_url}:{filename}"
         return hashlib.sha256(content.encode()).hexdigest()[:16]
     
-    def store_document(self, file_info: Dict) -> Tuple[str, bool]:
+    def store_document(self, file_info: Dict, collection: Optional[str] = None) -> Tuple[str, bool]:
         """
         Store a document and create database entry.
         
         Args:
             file_info: Dict with url, filename, file_type, local_path, file_size
+            collection: Optional collection name (e.g., "deleted", "main")
             
         Returns:
             Tuple of (Document ID, is_new: bool)
@@ -60,6 +61,7 @@ class DocumentStorage:
             shutil.copy2(source_path, stored_path)
             
             # Upload to S3 if configured (for ECS/Fargate persistence)
+            s3_key = None
             if Config.S3_BUCKET and BOTO3_AVAILABLE:
                 try:
                     s3_client = boto3.client('s3', region_name=Config.S3_REGION or 'us-east-1')
@@ -81,13 +83,15 @@ class DocumentStorage:
                 file_name=file_info['filename'],
                 file_type=file_info.get('file_type', 'unknown'),
                 file_size=file_info.get('file_size', 0),
-                doc_metadata=file_info
+                doc_metadata=file_info,
+                collection=collection,
+                s3_key_files=s3_key  # Store S3 key so we can serve directly
             )
             
             db.add(document)
             db.commit()
             
-            logger.info(f"Stored document {doc_id}: {file_info['filename']}")
+            logger.info(f"Stored document {doc_id}: {file_info['filename']} (collection: {collection or 'default'})")
             return doc_id, True
     
     def store_image_page(self, document_id: str, page_number: int, 

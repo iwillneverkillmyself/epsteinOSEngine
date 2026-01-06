@@ -75,6 +75,29 @@ def init_db():
     except Exception as e:
         logger.warning(f"Schema migration skipped/failed: {e}")
     
+    # Add collection column to documents table
+    try:
+        dialect = engine.dialect.name
+        with engine.begin() as conn:
+            if dialect == "sqlite":
+                cols = [r[1] for r in conn.execute(text("PRAGMA table_info(documents)")).fetchall()]
+                if "collection" not in cols:
+                    conn.execute(text("ALTER TABLE documents ADD COLUMN collection TEXT"))
+            elif dialect == "postgresql":
+                conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS collection VARCHAR"))
+            else:
+                # Best-effort on other dialects
+                conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS collection TEXT"))
+            # Create index on collection if it doesn't exist
+            if dialect == "sqlite":
+                indexes = [r[1] for r in conn.execute(text("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_collection'")).fetchall()]
+                if not indexes:
+                    conn.execute(text("CREATE INDEX idx_collection ON documents(collection)"))
+            elif dialect == "postgresql":
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_collection ON documents(collection)"))
+    except Exception as e:
+        logger.warning(f"Collection column migration skipped/failed: {e}")
+    
     # Add likes/dislikes columns to comments table
     try:
         dialect = engine.dialect.name

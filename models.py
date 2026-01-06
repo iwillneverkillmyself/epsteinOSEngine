@@ -26,9 +26,13 @@ class Document(Base):
     s3_presigned_url = Column(Text, nullable=True)
     s3_presigned_expires_at = Column(DateTime, nullable=True)
     
+    # Collection/category field for organizing documents (e.g., "deleted", "main", etc.)
+    collection = Column(String, nullable=True, default=None)
+    
     __table_args__ = (
         Index('idx_source_url', 'source_url'),
         Index('idx_file_name', 'file_name'),
+        Index('idx_collection', 'collection'),
     )
 
 
