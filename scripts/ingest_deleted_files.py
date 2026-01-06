@@ -4,14 +4,18 @@ Script to ingest deleted/removed files from local directory.
 
 This script:
 1. Scans a local directory for PDFs and images
-2. Processes them through the full pipeline (OCR, entity detection, indexing)
+2. Stores originals + page images (and uploads to S3 if configured)
 3. Marks them with collection="deleted" in the database
 
+Note: Deleted files are intended to be storage-only by default (no OCR/summaries/tags).
+You can opt into OCR with --with-ocr if you want text search later.
+
 Usage:
-    python scripts/ingest_deleted_files.py [--dir PATH] [--skip-existing]
+    python scripts/ingest_deleted_files.py [--dir PATH] [--skip-existing] [--with-ocr]
     
     --dir: Directory containing files to ingest (default: ~/Downloads/epstiendeleted:removed files)
     --skip-existing: Skip files that are already in the database (default: True)
+    --with-ocr: Run OCR + indexing after storing (default: False)
 """
 
 import sys
@@ -91,7 +95,7 @@ def discover_local_files(directory: Path) -> List[Dict]:
     return files
 
 
-def ingest_deleted_files(directory: Path, skip_existing: bool = True):
+def ingest_deleted_files(directory: Path, skip_existing: bool = True, with_ocr: bool = False):
     """
     Main ingestion function for deleted files.
     
@@ -105,9 +109,9 @@ def ingest_deleted_files(directory: Path, skip_existing: bool = True):
     
     # Initialize processors
     storage = DocumentStorage()
-    ocr_processor = OCRProcessor()
-    text_processor = TextProcessor()
-    indexer = SearchIndexer()
+    ocr_processor = OCRProcessor() if with_ocr else None
+    text_processor = TextProcessor() if with_ocr else None
+    indexer = SearchIndexer() if with_ocr else None
     
     temp_dir = Config.STORAGE_PATH / "deleted_files_temp"
     temp_dir.mkdir(parents=True, exist_ok=True)
@@ -169,25 +173,26 @@ def ingest_deleted_files(directory: Path, skip_existing: bool = True):
                     doc_id, page_num, image_path, width, height
                 )
             
-            # Process OCR using AWS Textract
-            logger.info(f"  Running AWS Textract OCR...")
-            pages_processed = ocr_processor.process_document(doc_id)
-            logger.info(f"  Processed {pages_processed} pages with OCR")
-            
-            # Process text (normalize, detect entities)
-            logger.info(f"  Extracting entities and normalizing text...")
-            with get_db() as db:
-                ocr_texts = db.query(OCRText).filter(
-                    OCRText.document_id == doc_id
-                ).all()
-            
-            for ocr_text in ocr_texts:
-                text_processor.process_ocr_text(ocr_text.id)
-            
-            # Index for search
-            logger.info(f"  Indexing for search...")
-            indexed = indexer.index_document(doc_id)
-            logger.info(f"  Indexed {indexed} OCR texts")
+            if with_ocr:
+                # Process OCR using configured OCR engine
+                logger.info(f"  Running OCR...")
+                pages_processed = ocr_processor.process_document(doc_id)  # type: ignore[union-attr]
+                logger.info(f"  Processed {pages_processed} pages with OCR")
+                
+                # Process text (normalize, detect entities)
+                logger.info(f"  Extracting entities and normalizing text...")
+                with get_db() as db:
+                    ocr_texts = db.query(OCRText).filter(
+                        OCRText.document_id == doc_id
+                    ).all()
+                
+                for ocr_text in ocr_texts:
+                    text_processor.process_ocr_text(ocr_text.id)  # type: ignore[union-attr]
+                
+                # Index for search
+                logger.info(f"  Indexing for search...")
+                indexed = indexer.index_document(doc_id)  # type: ignore[union-attr]
+                logger.info(f"  Indexed {indexed} OCR texts")
             
             files_processed += 1
             logger.info(f"  ✓ Successfully processed {file_info['filename']}")
@@ -244,11 +249,17 @@ def main():
         dest='skip_existing',
         help='Process all files even if already in database'
     )
+    parser.add_argument(
+        '--with-ocr',
+        action='store_true',
+        default=False,
+        help='Run OCR + indexing after storing (default: False)'
+    )
     
     args = parser.parse_args()
     
     directory = Path(args.dir)
-    ingest_deleted_files(directory, skip_existing=args.skip_existing)
+    ingest_deleted_files(directory, skip_existing=args.skip_existing, with_ocr=args.with_ocr)
 
 
 if __name__ == "__main__":
