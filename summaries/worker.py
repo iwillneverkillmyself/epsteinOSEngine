@@ -240,12 +240,23 @@ def summarize_and_tag_document(document_id: str, *, bedrock: Optional[BedrockCli
     return "succeeded", tags
 
 
-def backfill_documents(limit: int = 0, offset: int = 0, only_missing: bool = True) -> Dict[str, int]:
+def backfill_documents(limit: int = 0, offset: int = 0, only_missing: bool = True, collection: Optional[str] = None) -> Dict[str, int]:
     """
     Backfill summaries + tags for documents.
+    
+    Args:
+        limit: Number of documents to process (0 = all)
+        offset: Offset for pagination
+        only_missing: If True, only process docs without an existing succeeded summary
+        collection: Optional collection filter (e.g., "deleted") - only process documents in this collection
     """
     with get_db() as db:
         q = db.query(Document.id).order_by(Document.ingested_at.desc())
+        
+        # Filter by collection if specified
+        if collection is not None:
+            q = q.filter(Document.collection == collection)
+        
         if limit and limit > 0:
             q = q.offset(offset).limit(limit)
         doc_ids = [r[0] for r in q.all()]

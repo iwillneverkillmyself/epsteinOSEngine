@@ -3,6 +3,8 @@
 Usage:
   python scripts/backfill_summaries_and_tags.py --limit 100
   python scripts/backfill_summaries_and_tags.py --only-missing false
+  python scripts/backfill_summaries_and_tags.py --collection deleted
+  python scripts/backfill_summaries_and_tags.py --collection deleted --limit 50
 """
 
 from __future__ import annotations
@@ -32,6 +34,12 @@ def main():
         default="true",
         help="If true, only summarize docs without an existing succeeded summary",
     )
+    parser.add_argument(
+        "--collection",
+        type=str,
+        default=None,
+        help="Filter by collection (e.g., 'deleted') - only process documents in this collection",
+    )
     args = parser.parse_args()
 
     only_missing = args.only_missing.lower() in ("1", "true", "yes", "y")
@@ -41,7 +49,7 @@ def main():
         status, tags = summarize_and_tag_document(args.document_id)
         print(json.dumps({"document_id": args.document_id, "status": status, "tags": tags}, indent=2))
     else:
-        counts = backfill_documents(limit=args.limit, offset=args.offset, only_missing=only_missing)
+        counts = backfill_documents(limit=args.limit, offset=args.offset, only_missing=only_missing, collection=args.collection)
         print(json.dumps(counts, indent=2))
 
 
