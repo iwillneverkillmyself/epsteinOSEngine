@@ -2190,6 +2190,22 @@ async def get_thumbnail(
         raise HTTPException(status_code=500, detail="Failed to generate thumbnail")
 
 
+@app.get("/files/deleted")
+async def list_deleted_files(
+    limit: int = Query(50, ge=1, le=10000),
+    offset: int = Query(0, ge=0)
+):
+    """
+    List all deleted/removed files in the system with pagination.
+
+    IMPORTANT: This route must be defined before /files/{document_id} so it doesn't get
+    captured by the parameterized route.
+
+    Example: GET /files/deleted?limit=20&offset=0
+    """
+    return await search_files(q=None, has_text=None, limit=limit, offset=offset, collection="deleted")
+
+
 @app.get("/files/{document_id}")
 async def get_file(document_id: str):
     """
@@ -2675,21 +2691,6 @@ async def list_files(
             "total": total,
             "query": None
         }
-
-
-@app.get("/files/deleted")
-async def list_deleted_files(
-    limit: int = Query(50, ge=1, le=10000),
-    offset: int = Query(0, ge=0)
-):
-    """
-    List all deleted/removed files in the system with pagination.
-    
-    This endpoint returns only files marked with collection="deleted".
-    
-    Example: GET /files/deleted?limit=20&offset=0
-    """
-    return await search_files(q=None, has_text=None, limit=limit, offset=offset, collection="deleted")
 
 
 @app.get("/avatars/{username}")
